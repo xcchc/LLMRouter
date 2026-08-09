@@ -1,0 +1,31 @@
+# Codex/Playwright local debug artifacts
+.playwright-cli/
+router/.playwright-cli/
+
+# Local secrets and runtime data
+router/config.json
+router/stats.jsonl
+router/crash.log
+router/update-error.log
+router/*.log
+
+# Python environments and build output
+router/.venv/
+router/build/
+router/dist/
+router/__pycache__/
+router/**/__pycache__/
+router/*.py[cod]
+router/LLMRouter*.exe
+
+# Local editor/temp files
+.idea/
+.vscode/
+*.swp
+*.swo
+*.tmp
+*.bak
+
+# Local Windows shortcuts and generated browser screenshots
+router/*.lnk
+router/output/

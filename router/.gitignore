@@ -1,0 +1,60 @@
+# Local secrets and machine-specific configuration
+/config.json
+/config.local.json
+/config.*.json
+!/config.example.json
+/.env
+/.env.*
+!/.env.example
+/secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime data and diagnostics
+/stats.jsonl
+/crash.log
+/logs/
+*.log
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.tmp
+*.bak
+*.backup
+
+# Python environments and caches
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+/.coverage
+/coverage.xml
+/htmlcov/
+
+# Build and packaging output
+/build/
+/dist/
+/LLMRouter*.exe
+*.egg-info/
+
+# Local verification and backup directories
+/private-backup/
+/.verify-*/
+/.fresh-*/
+/_audit*/
+
+# Editor and operating-system files
+/.idea/
+/.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini

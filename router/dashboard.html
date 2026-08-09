@@ -1,0 +1,952 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Router 控制台</title>
+<style>
+:root{
+  --bg:#0d0f1a; --card:#151827; --card2:#1a1e33; --line:#262b45; --txt:#e8eaf6; --mut:#8b93a7;
+  --acc:#7c6cff; --acc2:#5fd4c4; --ok:#3ddc84; --err:#ff5d6c; --warn:#ffb648;
+}
+:root[data-theme="light"]{
+  --bg:#f2f5fa; --card:#ffffff; --card2:#e8edf6; --line:#d8dfee; --txt:#1b2133; --mut:#68728a;
+  --acc:#6a5cff; --acc2:#0e9d90; --ok:#1fae63; --err:#e5484d; --warn:#d98324;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--txt);min-height:100vh}
+.bg{position:fixed;inset:0;z-index:-1;background:
+  radial-gradient(600px 300px at 15% -5%,rgba(124,108,255,.16),transparent 60%),
+  radial-gradient(500px 260px at 90% 0%,rgba(95,212,196,.10),transparent 60%),
+  linear-gradient(180deg,#0d0f1a 0%,#0b0d16 100%)}
+:root[data-theme="light"] .bg{background:
+  radial-gradient(600px 300px at 15% -5%,rgba(124,108,255,.10),transparent 60%),
+  radial-gradient(500px 260px at 90% 0%,rgba(95,212,196,.08),transparent 60%),
+  linear-gradient(180deg,#eef1f8 0%,#f7f9fd 100%)}
+header{display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:18px 28px;border-bottom:1px solid var(--line);background:rgba(13,15,26,.75);backdrop-filter:blur(8px);position:sticky;top:0;z-index:10}
+:root[data-theme="light"] header{background:rgba(255,255,255,.82)}
+:root[data-theme="light"] .card{box-shadow:0 2px 10px rgba(30,40,80,.06)}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:flex;align-items:center;justify-content:center;font-weight:800;font-size:17px;color:#fff;box-shadow:0 4px 18px rgba(124,108,255,.4)}
+.brand h1{font-size:18px;letter-spacing:.3px}
+.brand .sub{font-size:12px;color:var(--mut);margin-top:2px}
+.header-right{margin-left:auto;display:flex;align-items:center;gap:10px}.status{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--mut);background:var(--card);border:1px solid var(--line);padding:6px 14px;border-radius:999px;cursor:pointer;transition:.15s;white-space:nowrap}.status:hover{border-color:var(--acc);color:var(--txt)}.status:disabled,.status.disabled{opacity:.55;cursor:not-allowed}.time-picker{display:none;gap:8px;align-items:center;flex-wrap:wrap}.time-picker.show{display:flex}.time-picker input[type="datetime-local"]{width:auto;min-width:225px}.time-picker label{color:var(--mut);font-size:12px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--mut)}
+.dot.ok{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.dot.bad{background:var(--err);box-shadow:0 0 8px var(--err)}
+nav{display:flex;gap:6px;width:100%}
+.tab{background:transparent;border:1px solid transparent;color:var(--mut);padding:8px 18px;border-radius:10px;cursor:pointer;font-size:14px;transition:.15s}
+.tab:hover{color:var(--txt);background:rgba(255,255,255,.04)}
+.tab.active{color:#fff;background:linear-gradient(135deg,rgba(124,108,255,.25),rgba(95,212,196,.18));border-color:rgba(124,108,255,.45)}
+main{padding:22px 28px 60px;max-width:1560px;margin:0 auto}
+.tabpane{display:none;animation:fade .25s ease}
+.tabpane.active{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin-bottom:18px}
+.card{background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--line);border-radius:14px;padding:16px 18px}
+.card h3{font-size:13px;color:var(--mut);font-weight:600;margin-bottom:12px;display:flex;align-items:center;gap:10px;justify-content:space-between}
+.stat .v{font-size:26px;font-weight:700;letter-spacing:.5px}
+.stat .l{font-size:12px;color:var(--mut);margin-top:4px}
+.stat .a{font-size:11px;color:var(--acc2);margin-top:6px}
+.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:18px}
+@media(max-width:900px){.grid2{grid-template-columns:minmax(0,1fr)}}
+.tblwrap{overflow:auto;max-height:380px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{color:var(--mut);font-weight:600;text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap;position:sticky;top:0;background:var(--card2)}
+td{padding:8px 10px;border-bottom:1px solid rgba(38,43,69,.55);white-space:nowrap}
+tr:hover td{background:rgba(255,255,255,.025)}
+.num{font-variant-numeric:tabular-nums;text-align:right}
+.badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;background:rgba(124,108,255,.18);color:#b9b1ff;border:1px solid rgba(124,108,255,.35)}
+:root[data-theme="light"] .badge{color:#5547e8;background:rgba(124,108,255,.10)}:root[data-theme="light"] .badge.ok{background:#e1f6ea;color:#0c7a43;border-color:#6fd09a;font-weight:600}:root[data-theme="light"] .badge.bad{background:#fde8ea;color:#c22a31;border-color:#f1a2a8;font-weight:600}
+.badge.chat{background:rgba(95,212,196,.15);color:var(--acc2);border-color:rgba(95,212,196,.35)}
+.badge.ok{background:rgba(61,220,132,.14);color:var(--ok);border-color:rgba(61,220,132,.35)}
+.badge.bad{background:rgba(255,93,108,.14);color:var(--err);border-color:rgba(255,93,108,.35)}
+.badge.mut{background:rgba(139,147,167,.12);color:var(--mut);border-color:rgba(139,147,167,.3)}
+.toolbar{display:flex;gap:10px;margin-bottom:16px;align-items:center}
+.btn{border:1px solid var(--line);background:var(--card2);color:var(--txt);padding:8px 16px;border-radius:10px;cursor:pointer;font-size:13px;transition:.15s}
+.btn:hover{border-color:var(--acc);color:#fff}
+.btn.primary{background:linear-gradient(135deg,var(--acc),#6a5cff);border:none;font-weight:600}
+.btn.primary:hover{filter:brightness(1.12)}
+.btn.danger{border-color:rgba(255,93,108,.4);color:var(--err)}
+.btn.danger:hover{background:rgba(255,93,108,.12)}
+.btn.ghost{background:transparent}
+.btn.sm{padding:4px 10px;font-size:12px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.supplier-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}
+.supplier-card .head{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.supplier-card .name{font-weight:700;font-size:15px}
+.supplier-card .row{font-size:12px;color:var(--mut);margin-top:5px;word-break:break-all}
+.supplier-card .row b{color:var(--txt);font-weight:600}
+.supplier-card .ops{display:flex;gap:8px;margin-top:14px}
+.form-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}
+.form-row label{font-size:13px;color:var(--mut);min-width:130px}
+input,select,textarea{background:var(--card2);border:1px solid var(--line);color:var(--txt);padding:8px 12px;border-radius:10px;font-size:13px;outline:none;font-family:inherit}
+input:focus,select:focus,textarea:focus{border-color:var(--acc)}
+input[type=number]{width:110px}
+textarea{width:100%;min-height:70px;resize:vertical}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:12px;color:var(--mut);margin-bottom:6px}
+.field input,.field select{width:100%}
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{background:rgba(124,108,255,.12);border:1px solid rgba(124,108,255,.3);color:#cfc9ff;padding:5px 12px;border-radius:999px;font-size:12px}
+:root[data-theme="light"] .chip{color:#5547e8}
+.chip .src{color:var(--mut);font-size:11px;margin-left:6px}
+.muted{color:var(--mut);font-size:12px;line-height:1.7}
+.modal{position:fixed;inset:0;background:rgba(5,6,12,.66);display:flex;align-items:center;justify-content:center;z-index:50;backdrop-filter:blur(4px)}
+:root[data-theme="light"] .modal{background:rgba(40,50,90,.35)}
+.modal.hidden{display:none}
+.modal-box{width:min(560px,94vw);max-height:88vh;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px 22px;box-shadow:0 24px 80px rgba(0,0,0,.5)}
+.modal-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.modal-head h3{font-size:16px}
+.test-result{margin-top:10px;font-size:13px;padding:10px 12px;border-radius:10px;display:none}
+.test-result.ok{display:block;background:rgba(61,220,132,.1);color:var(--ok)}
+.test-result.bad{display:block;background:rgba(255,93,108,.1);color:var(--err)}
+.toast{position:fixed;bottom:26px;left:50%;transform:translateX(-50%);background:var(--card2);border:1px solid var(--line);color:var(--txt);padding:11px 20px;border-radius:12px;font-size:13px;z-index:99;box-shadow:0 8px 30px rgba(0,0,0,.4)}
+.toast.hidden{display:none}
+.toast.ok{border-color:rgba(61,220,132,.5)}
+.toast.bad{border-color:rgba(255,93,108,.5)}
+.chart-tip{position:fixed;z-index:99;display:none;pointer-events:none;background:rgba(18,22,36,.96);color:#eef1f6;font-size:12px;line-height:1.5;padding:7px 10px;border-radius:8px;border:1px solid rgba(255,255,255,.14);box-shadow:0 8px 24px rgba(0,0,0,.35);white-space:pre-line}
+.link{color:var(--acc2);cursor:pointer;text-decoration:underline;font-size:12px}
+.empty{color:var(--mut);font-size:13px;padding:14px 4px}
+</style></head>
+<body>
+<div class="bg"></div>
+<header>
+  <div class="brand">
+    <div class="logo">LR</div>
+    <div><h1>LLM Router</h1><div class="sub">本地模型路由网关 · 控制台</div></div>
+  </div>
+  <div class="header-right">
+    <button class="status" id="btnGateway" title="检查网关状态"><span class="dot" id="statusDot"></span><span id="statusText">连接中…</span></button>
+    <button class="btn sm" id="btnTheme" title="切换深色/浅色主题">☀️ 浅色</button>
+  </div>
+  <nav>
+    <button class="tab active" data-tab="overview">概览</button>
+    <button class="tab" data-tab="suppliers">供应商</button>
+    <button class="tab" data-tab="models">模型路由</button>
+    <button class="tab" data-tab="settings">设置</button>
+  </nav>
+</header>
+<main>
+  <section id="tab-overview" class="tabpane active">
+    <div class="cards" id="statCards"></div>
+    <div class="form-row" style="margin-bottom:14px;flex-wrap:wrap;gap:8px">
+      <label>筛选</label>
+      <select id="chartFilter" style="min-width:200px"><option value="">全部模型</option></select>
+      <select id="timeFilter" style="min-width:140px">
+        <option value="nhours" selected>近 N 小时</option>
+        <option value="24">近 24 小时</option>
+        <option value="168">近 7 天</option>
+        <option value="720">近 30 天</option>
+        <option value="0">全部</option>
+        <option value="custom">自定义</option>
+      </select>
+      <input type="number" id="nHours" min="1" max="720" step="1" value="1" title="小时数" style="width:76px">
+      <div class="time-picker" id="timePicker">
+        <label for="startTime">开始</label>
+        <input type="datetime-local" id="startTime" step="1" title="开始时间（精确到秒）">
+        <label for="endTime">结束</label>
+        <input type="datetime-local" id="endTime" step="1" title="结束时间（精确到秒）">
+      </div>
+      <span class="muted" style="font-size:12px">统计卡、图表、表格都按所选模型和时间统计</span>
+    </div>
+    <div class="grid2">
+      <div class="card"><h3 id="titleChartReq">近 24 小时请求量</h3><canvas id="chartReq" height="88" style="width:100%;height:88px;display:block"></canvas></div>
+      <div class="card"><h3 id="titleChartTok">近 24 小时 Token 用量</h3><canvas id="chartTok" height="88" style="width:100%;height:88px;display:block"></canvas></div>
+    </div>
+    <div class="grid2">
+      <div class="card"><h3>按模型统计</h3><div class="tblwrap"><table id="tblModel"></table></div></div>
+      <div class="card"><h3>按供应商统计</h3><div class="tblwrap"><table id="tblSupplier"></table></div></div>
+    </div>
+    <div class="card"><h3 style="justify-content:space-between">最近请求（每页 50 条）
+      <span style="display:flex;gap:8px;align-items:center;font-weight:400">
+        <button class="btn sm" id="btnPagePrev">上一页</button>
+        <span id="pageInfo" class="muted" style="font-size:12px"></span>
+        <button class="btn sm" id="btnPageNext">下一页</button>
+        <button class="btn ghost sm" id="btnRefreshRecent">刷新</button>
+      </span>
+    </h3><div class="tblwrap"><table id="tblRecent"></table></div></div>
+  </section>
+
+  <section id="tab-suppliers" class="tabpane">
+    <div class="toolbar">
+      <button class="btn primary" id="btnAddSupplier">＋ 新增供应商</button>
+      <button class="btn ghost" id="btnRefreshSuppliers">刷新</button>
+    </div>
+    <div class="supplier-list" id="supplierList"></div>
+  </section>
+
+  <section id="tab-models" class="tabpane">
+    <div class="card">
+      <h3>模型路由</h3>
+      <div class="form-row">
+        <input id="newModelName" placeholder="模型名，如 gpt-5.6-sol" style="flex:1;min-width:200px">
+        <select id="newModelSupplier" style="min-width:140px"></select>
+        <select id="newModelMode" style="min-width:170px">
+          <option value="map">路由映射到该供应商</option>
+          <option value="manual">加入供应商手动模型列表</option>
+        </select>
+        <button class="btn primary" id="btnAddModel">添加模型</button>
+      </div>
+      <div class="tblwrap"><table id="tblModelMap"></table></div>
+      <div class="form-row" style="margin-top:16px">
+        <label>默认供应商（兜底）</label>
+        <select id="defaultSupplier" style="min-width:180px"></select>
+        <button class="btn" id="btnSaveDefault">保存</button>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h3>模型列表（来自各上游 / 手动配置）<button class="btn ghost sm" id="btnFetchModels">从上游获取</button><button class="btn ghost sm" id="btnRefreshMerged">刷新</button></h3>
+      <div class="tblwrap"><table id="tblMerged"></table></div>
+      <div id="hiddenModels" style="margin-top:10px"></div>
+    </div>
+  </section>
+
+  <section id="tab-settings" class="tabpane">
+    <div class="card">
+      <h3>基础设置</h3>
+        <div class="form-row"><label>端口（修改后需退出软件并手动重新启动）</label><input id="setPort" type="number" min="1" max="65535"></div>
+      <div class="form-row" style="margin-top:6px"><label>Codex++ 供应商地址</label>
+        <code id="baseUrl" style="background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:12px;color:var(--acc2);user-select:all">http://127.0.0.1:8765/v1</code>
+        <button class="btn sm" id="btnCopyUrl">复制</button>
+      </div>
+      <div class="form-row"><label style="min-width:0"><input id="setOpenBrowser" type="checkbox" style="width:auto"> 浏览器模式（不弹原生窗口，用浏览器打开控制台）</label></div>
+        <div class="form-row"><button class="btn primary" id="btnSaveSettings">保存设置</button><button class="btn" id="btnReload">重新加载配置</button></div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h3>统计</h3>
+      <p class="muted">统计数据保存在 <b>stats.jsonl</b>（与网关同目录），退出软件不会丢失。</p>
+      <div class="form-row"><button class="btn danger" id="btnClearStats">清空全部统计</button></div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h3>更新</h3>
+      <div class="form-row"><span id="updateStatus" class="muted">正在检查更新...</span></div>
+      <div class="form-row">
+        <button class="btn" id="btnCheckUpdate">检查更新</button>
+        <button class="btn primary" id="btnApplyUpdate" disabled>更新并重启</button>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h3>关于</h3>
+      <p class="muted">配置保存在 <b>config.json</b>。所有 API Key 只存在本机，不要把这个文件夹发给别人。<br>使用中遇到问题：查看 README.md，或把报错信息发给帮你配置的人。</p>
+      <div class="form-row"><button class="btn danger" id="btnExitApp">退出软件</button></div>
+    </div>
+  </section>
+</main>
+
+<div id="chartTip" class="chart-tip"></div>
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head"><h3 id="modalTitle">供应商</h3><button class="btn ghost" id="modalClose">✕</button></div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+</div>
+<div id="toast" class="toast hidden"></div><script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const nfmt = n => Number(n || 0).toLocaleString('zh-CN');
+const tfmt = n => { n = Number(n || 0); return n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(n); };
+const fmtTime = ts => new Date(ts*1000).toLocaleString('zh-CN', {hour12:false});
+const fmtDuration = ms => ms == null ? '—' : (Number(ms)/1000).toFixed(2) + ' s';
+function imageHandlingMap(s){
+  const raw = s && s.image_handling;
+  return (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+}
+let toastTimer = null;
+function toast(msg, type='ok'){
+  const t = $('#toast'); t.textContent = msg; t.className = 'toast ' + type;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.className = 'toast hidden', 2600);
+}
+async function api(path, opts={}){
+  const res = await fetch(path, {headers:{'Content-Type':'application/json'}, ...opts});
+  let data = null;
+  try { data = await res.json(); } catch(e) {}
+  if(!res.ok){ throw new Error((data && data.error) || ('HTTP ' + res.status)); }
+  return data;
+}
+function statusBadge(st){
+  if(st === 'ok') return '<span class="badge ok">成功</span>';
+  if(st === 'failed') return '<span class="badge bad">失败</span>';
+  return '<span class="badge bad">错误</span>';
+}
+function hitRateCell(r){
+  const inp = Number(r.input_tokens || 0);
+  const cached = Number(r.cached_tokens || 0);
+  if(!inp) return '<span class="mut">—</span>';
+  const pct = Math.min(100, Math.round(cached / inp * 100));
+  return `<span class="badge ${pct > 0 ? 'ok' : 'mut'}">${pct}%</span>`;
+}
+// ---------- tabs ----------
+document.querySelectorAll('.tab').forEach(btn => btn.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tabpane').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  $('#tab-' + btn.dataset.tab).classList.add('active');
+  if(btn.dataset.tab === 'suppliers') loadSuppliers();
+  if(btn.dataset.tab === 'models') loadModelsTab();
+  if(btn.dataset.tab === 'settings') loadSettings();
+  if(btn.dataset.tab === 'overview') loadOverview();
+}));
+// ---------- charts ----------
+function showChartTip(x, y, text){
+  const t = $('#chartTip');
+  if(!t) return;
+  t.textContent = text;
+  t.style.display = 'block';
+  t.style.left = Math.min(x + 12, window.innerWidth - t.offsetWidth - 8) + 'px';
+  t.style.top = Math.max(8, y - t.offsetHeight - 10) + 'px';
+}
+function hideChartTip(){
+  const t = $('#chartTip');
+  if(t) t.style.display = 'none';
+}
+function drawBars(canvas, labels, values, color, valueLabel){
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 600, h = canvas.clientHeight || 88;
+  canvas.width = w * dpr; canvas.height = h * dpr; ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+  const max = Math.max(...values, 1), pad = 8, bottom = 20;
+  const bw = (w - pad*2) / Math.max(labels.length, 1);
+  ctx.fillStyle = color;
+  const bars = [];
+  values.forEach((v, i) => {
+    const bh = (v / max) * (h - bottom - 10);
+    const x = pad + i * bw + bw * 0.18;
+    const y = h - bottom - bh;
+    const barWidth = bw * 0.64;
+    bars.push({x, y, width:barWidth, height:bh});
+    ctx.beginPath();
+    if(ctx.roundRect){ ctx.roundRect(x, y, barWidth, bh, 3); }
+    else { ctx.rect(x, y, barWidth, bh); }
+    ctx.fill();
+  });
+  ctx.fillStyle = '#8b93a7'; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
+  labels.forEach((l, i) => { if(i % 3 === 0 || i === labels.length - 1) ctx.fillText(l, pad + i * bw + bw * 0.5, h - 7); });
+  canvas._chart = {labels, values, bars, valueLabel};
+  if(!canvas._tipBound){
+    canvas._tipBound = true;
+    canvas.addEventListener('mousemove', e => {
+      const c = canvas._chart;
+      if(!c) return;
+      const rect = canvas.getBoundingClientRect();
+      const px = e.clientX - rect.left, py = e.clientY - rect.top;
+      const i = c.bars.findIndex(b => b.height > 0 && px >= b.x && px <= b.x + b.width && py >= b.y && py <= b.y + b.height);
+      if(i < 0){ canvas.style.cursor = 'default'; hideChartTip(); return; }
+      canvas.style.cursor = 'pointer';
+      showChartTip(e.clientX, e.clientY, `时间：${c.labels[i]}\n${c.valueLabel}：${Number(c.values[i] || 0).toLocaleString('zh-CN')}`);
+    });
+    canvas.addEventListener('mouseleave', () => { canvas.style.cursor = 'default'; hideChartTip(); });
+  }
+}
+// ---------- overview ----------
+let chartModel = '';
+let timeHours = 1;
+let timeMode = 'nhours';
+const clampHours = n => Math.max(1, Math.min(720, Number(n) || 1));
+const timeLabel = () => timeMode === 'custom' ? '自定义时间' : (timeMode === 'nhours' ? `近 ${timeHours} 小时` : ({24:'近 24 小时',168:'近 7 天',720:'近 30 天',0:'全部'}[timeHours] || '近 24 小时'));
+function toLocalInput(ts){
+  if(!ts) return '';
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function timeParams(){
+  if(timeMode === 'custom'){
+    const st = $('#startTime') ? new Date($('#startTime').value).getTime() / 1000 : 0;
+    const en = $('#endTime') ? new Date($('#endTime').value).getTime() / 1000 : 0;
+    const p = {hours: '', start: '', end: ''};
+    if(Number.isFinite(st) && st > 0) p.start = String(Math.floor(st));
+    if(Number.isFinite(en) && en > 0) p.end = String(Math.floor(en));
+    return p;
+  }
+  return {hours: String(timeHours), start: '', end: ''};
+}
+function applyTimePicker(v){
+  const picker = $('#timePicker');
+  const n = $('#nHours');
+  if(n) n.style.display = v === 'nhours' ? '' : 'none';
+  if(picker) picker.classList.toggle('show', v === 'custom');
+  if(v === 'custom' && !$('#startTime').value){
+    const now = Math.floor(Date.now() / 1000);
+    $('#startTime').value = toLocalInput(now - 24 * 3600);
+    $('#endTime').value = toLocalInput(now);
+  }
+}
+function applyTheme(t){
+  document.documentElement.dataset.theme = t;
+  try{ localStorage.setItem('llm_theme_v2', t); }catch(e){}
+  const b = $('#btnTheme');
+  if(b) b.textContent = t === 'light' ? '🌙 深色' : '☀️ 浅色';
+}
+let savedTheme = 'light';
+try{ savedTheme = localStorage.getItem('llm_theme_v2') || 'light'; }catch(e){}
+applyTheme(savedTheme);
+async function loadOverview(){
+  try{
+    const params = new URLSearchParams();
+    if(chartModel) params.set('model', chartModel);
+    const tp = timeParams();
+    if(tp.hours) params.set('hours', tp.hours);
+    if(tp.start) params.set('start', tp.start);
+    if(tp.end) params.set('end', tp.end);
+    const s = await api('/api/stats/summary?' + params.toString());
+    const filterSel = $('#chartFilter');
+    if(filterSel){
+      const models = s.all_models || [];
+      const optionValues = Array.from(filterSel.options).map(o => o.value);
+      const wantedValues = ['', ...models];
+      if(JSON.stringify(optionValues) !== JSON.stringify(wantedValues)){
+        filterSel.innerHTML = '<option value="">全部模型</option>' + models.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+      }
+      if(chartModel && !models.includes(chartModel)) chartModel = '';
+      filterSel.value = chartModel;
+    }
+    const tl = timeLabel();
+    const hitRate = s.total.input ? Math.round((s.total.cached || 0) / s.total.input * 100) + '%' : '—';
+    const cards = [
+      [tl + '请求', s.total.requests, '错误 ' + s.total.errors],
+      [tl + ' Tokens', tfmt(s.total.total), '输入 ' + tfmt(s.total.input) + ' · 输出 ' + tfmt(s.total.output)],
+      ['推理 Tokens', tfmt(s.total.reasoning), '范围内合计'],
+      ['平均耗时', s.total.requests ? Number(s.avg_duration_seconds || 0).toFixed(1) + ' 秒' : '—', ''],
+      ['缓存命中率', hitRate, '缓存 ' + tfmt(s.total.cached) + ' / 输入 ' + tfmt(s.total.input)],
+    ];
+    $('#statCards').innerHTML = cards.map(c => `<div class="card stat"><div class="v">${esc(c[1])}</div><div class="l">${esc(c[0])}</div><div class="a">${esc(c[2])}</div></div>`).join('');
+    $('#titleChartReq').textContent = tl + ' 请求量';
+    $('#titleChartTok').textContent = tl + ' Token 用量';
+    drawBars($('#chartReq'), s.hourly.map(h => h.hour), s.hourly.map(h => h.requests), 'rgba(124,108,255,.85)', '请求量');
+    drawBars($('#chartTok'), s.hourly.map(h => h.hour), s.hourly.map(h => h.tokens), 'rgba(95,212,196,.85)', 'Token 用量');
+    const mRows = s.by_model.map(m => `<tr><td>${esc(m.name)}</td><td>${esc(m['supplier'] ?? '')}</td><td class="num">${nfmt(m.requests)}</td><td class="num">${m.errors ? '<span style="color:var(--err)">' + nfmt(m.errors) + '</span>' : '0'}</td><td class="num">${nfmt(m.input)}</td><td class="num">${nfmt(m.cached)}</td><td class="num">${nfmt(m.output)}</td><td class="num">${nfmt(m.reasoning)}</td><td class="num">${nfmt(m.total)}</td><td class="num">${m.cost > 0 ? '¥' + m.cost.toFixed(2) : '—'}</td></tr>`).join('');
+    $('#tblModel').innerHTML = `<thead><tr><th>模型</th><th>供应商</th><th>请求</th><th>错误</th><th>输入</th><th>缓存</th><th>输出</th><th>推理</th><th>总量</th><th>费用</th></tr></thead><tbody>${mRows || '<tr><td colspan="10" class="empty">暂无数据</td></tr>'}</tbody>`;
+    const sRows = s.by_supplier.map(m => `<tr><td>${esc(m.name)}</td><td class="num">${nfmt(m.requests)}</td><td class="num">${m.errors ? '<span style="color:var(--err)">' + nfmt(m.errors) + '</span>' : '0'}</td><td class="num">${nfmt(m.input)}</td><td class="num">${nfmt(m.cached)}</td><td class="num">${nfmt(m.output)}</td><td class="num">${nfmt(m.reasoning)}</td><td class="num">${nfmt(m.total)}</td><td class="num">${m.cost > 0 ? '¥' + m.cost.toFixed(2) : '—'}</td></tr>`).join('');
+    $('#tblSupplier').innerHTML = `<thead><tr><th>供应商</th><th>请求</th><th>错误</th><th>输入</th><th>缓存</th><th>输出</th><th>推理</th><th>总量</th><th>费用</th></tr></thead><tbody>${sRows || '<tr><td colspan="9" class="empty">暂无数据</td></tr>'}</tbody>`;
+  }catch(e){ /* 网关未就绪时静默 */ }
+}
+let recentPage = 1;
+const PAGE_SIZE = 50;
+async function loadRecent(){
+  try{
+    const params = new URLSearchParams({limit: String(PAGE_SIZE), offset: String((recentPage - 1) * PAGE_SIZE)});
+    if(chartModel) params.set('model', chartModel);
+    const tp = timeParams();
+    if(tp.hours) params.set('hours', tp.hours);
+    if(tp.start) params.set('start', tp.start);
+    if(tp.end) params.set('end', tp.end);
+    const {records, total} = await api('/api/stats/raw?' + params.toString());
+    const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+    if(recentPage > totalPages){ recentPage = totalPages; }
+    $('#pageInfo').textContent = `第 ${recentPage} / ${totalPages} 页 · 共 ${nfmt(total)} 条`;
+    $('#btnPagePrev').disabled = recentPage <= 1;
+    $('#btnPageNext').disabled = recentPage >= totalPages;
+    const rows = records.slice().reverse().map(r => `<tr>
+      <td>${fmtTime(r.ts)}</td><td>${esc(r.model)}</td><td>${esc(r.reasoning_effort || '—')}</td><td>${esc(r.supplier)}</td>
+      <td><span class="badge ${r.upstream_wire === 'chat' ? 'chat' : ''}">${r.incoming_wire}→${r.upstream_wire}</span></td>
+      <td>${statusBadge(r.status)}</td><td class="num">${fmtDuration(r.duration_ms)}</td>
+      <td class="num">${r.input_tokens ?? '—'}</td><td class="num">${r.cached_tokens > 0 ? '<span style="color:var(--ok)" title="缓存命中，按缓存价计费">✓ ' + nfmt(r.cached_tokens) + '</span>' : '<span class="mut">—</span>'}</td><td class="num">${hitRateCell(r)}</td><td class="num">${r.output_tokens ?? '—'}</td><td class="num">${r.reasoning_tokens ?? '—'}</td><td class="num">${r.total_tokens ?? '—'}</td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis" title="${esc(r.error || '')}">${esc((r.error || '').slice(0, 40))}</td>
+    </tr>`).join('');
+    $('#tblRecent').innerHTML = `<thead><tr><th>时间</th><th>模型</th><th>推理强度</th><th>供应商</th><th>协议</th><th>状态</th><th>耗时 (s)</th><th>输入</th><th>缓存</th><th>命中率</th><th>输出</th><th>推理</th><th>总量</th><th>错误</th></tr></thead><tbody>${rows || '<tr><td colspan="14" class="empty">暂无请求记录</td></tr>'}</tbody>`;
+  }catch(e){}
+}
+// ---------- suppliers ----------
+async function loadSuppliers(){
+  try{
+    const cfg = await api('/api/config');
+    const list = $('#supplierList');
+    if(!cfg.suppliers.length){ list.innerHTML = '<div class="empty">还没有供应商，点右上角"新增供应商"添加。</div>'; return; }
+    list.innerHTML = cfg.suppliers.map(s => {
+      const key = s.api_key ? 'sk-••••' + String(s.api_key).slice(-4) : '（空）';
+      const pIn = Number(s.price_input_per_1m || 0), pOut = Number(s.price_output_per_1m || 0);
+      const pC = (s.price_input_cached_per_1m !== undefined && s.price_input_cached_per_1m !== '') ? Number(s.price_input_cached_per_1m) : pIn;
+      const price = (pIn || pOut) ? '输入 ¥' + pIn + ' / 缓存 ¥' + pC + ' / 输出 ¥' + pOut + ' 每百万' : '未设置';
+      const imageModes = Object.values(imageHandlingMap(s));
+      const vlmCount = imageModes.filter(v => v === 'vlm').length;
+      const stripCount = imageModes.filter(v => v === 'strip').length;
+      const imageSummary = [vlmCount ? `VLM ${vlmCount}` : '', stripCount ? `省略 ${stripCount}` : ''].filter(Boolean).join(' · ') || '全部原样发送';
+      return `<div class="card supplier-card">
+        <div class="head"><span class="name">${esc(s.name)}</span><span class="badge ${s.wire_api === 'chat' ? 'chat' : ''}">${esc(s.wire_api || 'responses')}</span>${cfg.default_supplier === s.name ? '<span class="badge mut">默认</span>' : ''}</div>
+        <div class="row">地址：<b>${esc(s.base_url)}</b></div>
+        <div class="row">Key：<b>${key}</b></div>
+        <div class="row">手动模型：<b>${(s.models || []).length} 个</b>（其余自动获取）</div>
+        <div class="row">图片处理：<b>${imageSummary}</b>${vlmCount && s.vlm_supplier ? ' · ' + esc(s.vlm_supplier) + ' / ' + esc(s.vlm_model || '') + ' · ' + (s.vlm_prompt_mode === 'template' ? '内置模板' : '主模型规划') : ''}</div>
+        <div class="row">隐藏模型：<b>${((cfg.model_blacklist || {})[s.name] || []).length} 个</b>（模型列表里"隐藏"的）</div>
+        <div class="row">价格：<b>${price}</b>（元/百万tokens，可选）</div>
+        <div class="ops">
+          <button class="btn sm" onclick="openSupplierModal('${esc(s.name)}')">编辑</button>
+          <button class="btn sm" onclick="testSupplier('${esc(s.name)}')">测试连接</button>
+          <button class="btn sm danger" onclick="deleteSupplier('${esc(s.name)}')">删除</button>
+        </div>
+      </div>`;
+    }).join('');
+  }catch(e){ toast('加载供应商失败：' + e.message, 'bad'); }
+}
+async function testSupplier(name){
+  try{
+    const cfg = await api('/api/config');
+    const s = cfg.suppliers.find(x => x.name === name);
+    if(!s) return;
+    const r = await api('/api/test-supplier', {method:'POST', body: JSON.stringify({base_url: s.base_url, api_key: s.api_key})});
+    if(r.ok) toast(`连接成功，发现 ${r.count} 个模型`);
+    else toast('连接失败：' + r.error, 'bad');
+  }catch(e){ toast('测试失败：' + e.message, 'bad'); }
+}
+async function deleteSupplier(name){
+  if(!confirm(`确定删除供应商「${name}」？其路由映射也会被移除。`)) return;
+  try{ await api('/api/suppliers/' + encodeURIComponent(name), {method:'DELETE'}); toast('已删除'); loadSuppliers(); }
+  catch(e){ toast(e.message, 'bad'); }
+}
+function openSupplierModal(name){
+  const modal = $('#modal');
+  api('/api/config').then(cfg => {
+    const s = name ? cfg.suppliers.find(x => x.name === name) : null;
+    const supplierModelMap = {};
+    cfg.suppliers.forEach(x => {
+      const arr = supplierModelMap[x.name] || (supplierModelMap[x.name] = []);
+      (x.models || []).forEach(mid => { if(!arr.includes(mid)) arr.push(mid); });
+    });
+    Object.entries(cfg.model_map || {}).forEach(([mid, supplierName]) => {
+      const arr = supplierModelMap[supplierName] || (supplierModelMap[supplierName] = []);
+      if(!arr.includes(mid)) arr.push(mid);
+    });
+    const supName = s ? s.name : '';
+    const myModels = [];
+    (supplierModelMap[supName] || []).forEach(mid => { if(!myModels.includes(mid)) myModels.push(mid); });
+    const imageModes = {...imageHandlingMap(s)};
+    Object.keys(imageModes).forEach(mid => { if(!myModels.includes(mid)) myModels.push(mid); });
+    const supOpts = cfg.suppliers.map(x => `<option value="${esc(x.name)}">${esc(x.name)}</option>`).join('');
+    const modeName = {'send-as-is':'原样发送','strip':'省略图片','vlm':'视觉描述（VLM）'};
+    $('#modalTitle').textContent = s ? '编辑供应商：' + s.name : '新增供应商';
+    $('#modalBody').innerHTML = `
+      <div class="field"><label>名称（改名后，路由映射/默认供应商会自动跟着改）</label><input id="fName" value="${esc(s ? s.name : '')}"></div>
+      <div class="field"><label>接口地址 Base URL（形如 https://xxx.com/v1）</label><input id="fBase" value="${esc(s ? s.base_url : '')}" placeholder="https://api.example.com/v1"></div>
+      <div class="field"><label>API Key</label><input id="fKey" type="password" value="${esc(s ? s.api_key : '')}" placeholder="sk-..."></div>
+      <div class="field"><label>协议</label><select id="fWire">
+        <option value="responses" ${s && s.wire_api === 'chat' ? '' : 'selected'}>responses（OpenAI Responses 接口）</option>
+        <option value="chat" ${s && s.wire_api === 'chat' ? 'selected' : ''}>chat（Chat Completions 接口）</option>
+      </select></div>
+      <div class="field"><label>手动模型列表（可选，每行一个；留空则自动从上游获取）</label><textarea id="fModels" placeholder="gpt-5.6-sol&#10;deepseek-v4-flash">${esc((s && s.models || []).join('\n'))}</textarea></div>
+      <div class="field"><label>图片处理模式（按模型选择；选择 VLM 后可设置视觉辅助供应商和视觉模型）</label><div id="fImageModeRows"></div></div>
+      <div id="fVlmFields" style="display:none">
+        <div class="field"><label>视觉辅助供应商（复用其 API Key）</label><select id="fVlmSupplier"><option value="">（选择供应商）</option>${supOpts}</select></div>
+        <div class="field"><label>视觉模型</label><select id="fVlmModel"></select></div>
+        <div class="field"><label>视觉提示词生成</label><select id="fVlmPromptMode" title="主模型规划会增加一次文本请求；失败时自动使用内置模板">
+          <option value="main-model" ${!s || s.vlm_prompt_mode !== 'template' ? 'selected' : ''}>主模型规划</option>
+          <option value="template" ${s && s.vlm_prompt_mode === 'template' ? 'selected' : ''}>内置模板</option>
+        </select></div>
+      </div>
+      <div class="field"><label>价格（可选，元/百万tokens；缓存命中的输入按缓存价计费）</label>
+        <div class="form-row" style="margin:0"><input id="fPIn" type="number" step="0.01" min="0" placeholder="输入价" style="flex:1" value="${s ? (s.price_input_per_1m || '') : ''}"><input id="fPOut" type="number" step="0.01" min="0" placeholder="输出价" style="flex:1" value="${s ? (s.price_output_per_1m || '') : ''}"></div>
+        <div class="form-row" style="margin:6px 0 0"><input id="fCIn" type="number" step="0.01" min="0" placeholder="缓存输入价（便宜价，可选；留空则按输入价）" style="flex:1" value="${s ? (s.price_input_cached_per_1m ?? '') : ''}"></div>
+      </div>
+      <div class="form-row"><button class="btn" id="fTest">测试连接</button><span id="fTestResult"></span></div>
+      <div class="form-row" style="margin-top:18px"><button class="btn primary" id="fSave">保存</button><button class="btn ghost" id="fCancel">取消</button></div>`;
+    modal.classList.remove('hidden');
+    function currentImageHandling(){
+      return {...imageModes};
+    }
+    function addMergedModels(md){
+      ((md && md.models) || []).forEach(m => {
+        const arr = supplierModelMap[m.supplier] || (supplierModelMap[m.supplier] = []);
+        if(!arr.includes(m.id)) arr.push(m.id);
+        if(m.supplier === supName && !myModels.includes(m.id)) myModels.push(m.id);
+      });
+    }
+    function fillVlmModelOptions(supplierName, selectedModel){
+      const models = (supplierModelMap[supplierName] || []).filter((m, i, a) => a.indexOf(m) === i);
+      let html = '<option value="">（选择模型）</option>';
+      if(selectedModel && !models.includes(selectedModel)) html += `<option value="${esc(selectedModel)}">${esc(selectedModel)}</option>`;
+      html += models.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+      $('#fVlmModel').innerHTML = html;
+      if(selectedModel) $('#fVlmModel').value = selectedModel;
+    }
+    async function refreshVlmModels(supplierName, selectedModel){
+      fillVlmModelOptions(supplierName, selectedModel);
+      if(!supplierName) return;
+      try{
+        const res = await api('/api/suppliers/' + encodeURIComponent(supplierName) + '/fetch-models', {method:'POST'});
+        const arr = supplierModelMap[supplierName] || (supplierModelMap[supplierName] = []);
+        (res.models || []).forEach(mid => { if(!arr.includes(mid)) arr.push(mid); });
+        fillVlmModelOptions(supplierName, selectedModel || $('#fVlmModel').value);
+      }catch(e){ /* 保留已有模型列表 */ }
+    }
+    function updateVlmVisibility(){
+      const hasVlm = Array.from($('#fImageModeRows').querySelectorAll('select.img-mode')).some(sel => sel.value === 'vlm');
+      $('#fVlmFields').style.display = hasVlm ? '' : 'none';
+    }
+    function renderImageModeRows(){
+      const cur = currentImageHandling();
+      const typed = ($('#fModels').value || '').split('\n').map(x => x.trim()).filter(Boolean);
+      const all = [];
+      [...myModels, ...typed, ...Object.keys(imageModes)].forEach(mid => { if(!all.includes(mid)) all.push(mid); });
+      const box = $('#fImageModeRows');
+      if(!all.length){
+        box.innerHTML = '<div class="muted">暂无模型。先在“手动模型列表”中添加模型，或保存供应商后从上游获取模型。</div>';
+        return;
+      }
+      box.innerHTML = '<div class="tblwrap" style="max-height:220px;overflow:auto"><table><thead><tr><th style="text-align:left">模型</th><th style="text-align:left">图片处理</th></tr></thead><tbody>' +
+        all.map(mid => {
+          const mode = cur[mid] || 'send-as-is';
+          return `<tr><td>${esc(mid)}</td><td style="min-width:150px"><select class="img-mode" data-model="${esc(mid)}">
+            <option value="send-as-is" ${mode==='send-as-is'?'selected':''}>${modeName['send-as-is']}</option>
+            <option value="strip" ${mode==='strip'?'selected':''}>${modeName['strip']}</option>
+            <option value="vlm" ${mode==='vlm'?'selected':''}>${modeName['vlm']}</option>
+          </select></td></tr>`;
+        }).join('') + '</tbody></table></div>';
+      box.querySelectorAll('select.img-mode').forEach(sel => sel.addEventListener('change', () => {
+        if(sel.value === 'send-as-is') delete imageModes[sel.dataset.model];
+        else imageModes[sel.dataset.model] = sel.value;
+        updateVlmVisibility();
+      }));
+    }
+    renderImageModeRows();
+    updateVlmVisibility();
+    if(s && s.vlm_supplier){
+      $('#fVlmSupplier').value = s.vlm_supplier;
+      refreshVlmModels(s.vlm_supplier, s.vlm_model || '');
+    } else {
+      fillVlmModelOptions('', '');
+    }
+    $('#fModels').addEventListener('input', () => { renderImageModeRows(); updateVlmVisibility(); });
+    $('#fVlmSupplier').addEventListener('change', () => refreshVlmModels($('#fVlmSupplier').value, ''));
+    api('/api/merged-models').then(md => {
+      addMergedModels(md);
+      renderImageModeRows();
+      updateVlmVisibility();
+      if($('#fVlmSupplier').value) fillVlmModelOptions($('#fVlmSupplier').value, $('#fVlmModel').value);
+    }).catch(() => {});
+    $('#fTest').onclick = async () => {
+      const r = $('#fTestResult');
+      r.textContent = '测试中…'; r.style.color = 'var(--mut)';
+      try{
+        const res = await api('/api/test-supplier', {method:'POST', body: JSON.stringify({base_url: $('#fBase').value.trim(), api_key: $('#fKey').value.trim()})});
+        if(res.ok){ r.textContent = `✓ 连接成功，发现 ${res.count} 个模型`; r.style.color = 'var(--ok)'; }
+        else { r.textContent = '✗ ' + res.error; r.style.color = 'var(--err)'; }
+      }catch(e){ r.textContent = '✗ ' + e.message; r.style.color = 'var(--err)'; }
+    };
+    $('#fSave').onclick = async () => {
+      const data = {
+        name: ($('#fName').value || '').trim(),
+        base_url: ($('#fBase').value || '').trim(),
+        api_key: ($('#fKey').value || '').trim(),
+        wire_api: $('#fWire').value,
+        models: ($('#fModels').value || '').split('\n').map(x => x.trim()).filter(Boolean),
+        image_handling: currentImageHandling(),
+        vlm_supplier: ($('#fVlmSupplier').value || '').trim(),
+        vlm_model: ($('#fVlmModel').value || '').trim(),
+        vlm_prompt_mode: $('#fVlmPromptMode').value,
+        price_input_per_1m: Number($('#fPIn').value) || 0,
+        price_output_per_1m: Number($('#fPOut').value) || 0,
+        price_input_cached_per_1m: Number($('#fCIn').value) || 0,
+      };
+      if(!data.name || !data.base_url){ toast('名称和接口地址不能为空', 'bad'); return; }
+      if(Object.values(data.image_handling).includes('vlm') && (!data.vlm_supplier || !data.vlm_model)){
+        toast('选择 VLM 后，请同时选择视觉辅助供应商和视觉模型', 'bad'); return;
+      }
+      try{
+        if(s){ await api('/api/suppliers/' + encodeURIComponent(s.name), {method:'PUT', body: JSON.stringify(data)}); }
+        else { await api('/api/suppliers', {method:'POST', body: JSON.stringify(data)}); }
+        toast('已保存'); modal.classList.add('hidden'); loadSuppliers();
+      }catch(e){ toast(e.message, 'bad'); }
+    };
+    $('#fCancel').onclick = () => modal.classList.add('hidden');
+  }).catch(e => toast(e.message, 'bad'));
+}
+// ---------- models ----------
+async function loadModelsTab(){
+  try{
+    const cfg = await api('/api/config');
+    const supOpts = cfg.suppliers.map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
+    $('#newModelSupplier').innerHTML = supOpts;
+    $('#defaultSupplier').innerHTML = '<option value="">（不设置）</option>' + supOpts;
+    $('#defaultSupplier').value = cfg.default_supplier || '';
+    const mm = cfg.model_map || {};
+    const keys = Object.keys(mm);
+    $('#tblModelMap').innerHTML = `<thead><tr><th>模型名</th><th>路由到供应商</th><th></th></tr></thead><tbody>${
+      keys.map(k => `<tr data-model="${esc(k)}"><td>${esc(k)}</td><td><select class="mm-sel">${supOpts.replace(/<option value="([^"]+)"/g, (m, v) => `<option value="${esc(v)}"${v === mm[k] ? ' selected' : ''}`)}</select></td><td><button class="btn sm danger" onclick="delModelMap('${esc(k)}')">删除</button></td></tr>`).join('')
+      || '<tr><td colspan="3" class="empty">暂无映射。在下方输入模型名添加，或依赖各上游的模型列表自动路由。</td></tr>'
+    }</tbody>`;
+    document.querySelectorAll('.mm-sel').forEach(sel => sel.addEventListener('change', saveModelMap));
+    await loadMerged();
+  }catch(e){ toast('加载失败：' + e.message, 'bad'); }
+}
+async function saveModelMap(){
+  const cfg = await api('/api/config');
+  const mm = {};
+  document.querySelectorAll('#tblModelMap tbody tr[data-model]').forEach(tr => { mm[tr.dataset.model] = tr.querySelector('select').value; });
+  try{
+    await api('/api/model_map', {method:'PUT', body: JSON.stringify({model_map: mm, default_supplier: $('#defaultSupplier').value})});
+    toast('已保存'); loadModelsTab();
+  }catch(e){ toast(e.message, 'bad'); }
+}
+async function delModelMap(model){
+  try{ await api('/api/model_map/' + encodeURIComponent(model), {method:'DELETE'}); toast('已删除'); loadModelsTab(); }
+  catch(e){ toast(e.message, 'bad'); }
+}
+async function loadMerged(){
+  try{
+    const [cfg, merged] = await Promise.all([api('/api/config'), api('/api/merged-models')]);
+    const {models, hidden} = merged;
+    const rows = models.map(m => `<tr>
+      <td>${esc(m.id)}</td>
+      <td>${esc(m.supplier)}</td>
+      <td>${m.source === 'map' ? '<span class="badge mut">路由映射</span>' : m.source === 'manual' ? '<span class="badge">手动</span>' : '<span class="badge chat">上游</span>'}</td>
+      <td>${modelPriceText(m.id, m.supplier, cfg)}</td>
+      <td><button class="btn sm" onclick="openModelPriceModal('${esc(m.id)}','${esc(m.supplier)}')">设价</button> <button class="btn sm danger" onclick="hideModel('${esc(m.supplier)}','${esc(m.id)}',${m.source === 'map'})">隐藏</button></td>
+    </tr>`).join('');
+    $('#tblMerged').innerHTML = `<thead><tr><th>模型</th><th>来源供应商</th><th>来源</th><th>价格（元/百万）</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="5" class="empty">暂无模型（检查供应商地址/Key，或点"从上游获取"）</td></tr>'}</tbody>`;
+    $('#hiddenModels').innerHTML = hidden.length
+      ? `<div class="muted">已隐藏 ${hidden.length} 个模型：${hidden.map(h => esc(h.id) + '（' + esc(h.supplier) + '）').join('、')}　<button class="btn sm" onclick="unhideAll()">全部恢复</button></div>`
+      : '';
+  }catch(e){}
+}
+function modelPriceText(model, supplier, cfg){
+  const mp = (cfg.model_prices || {})[model] || {};
+  const s = cfg.suppliers.find(x => x.name === supplier) || {};
+  const hasOwn = mp.price_input_per_1m != null || mp.price_output_per_1m != null || mp.price_input_cached_per_1m != null;
+  const inP = mp.price_input_per_1m != null ? Number(mp.price_input_per_1m) : (s.price_input_per_1m ? Number(s.price_input_per_1m) : null);
+  const outP = mp.price_output_per_1m != null ? Number(mp.price_output_per_1m) : (s.price_output_per_1m ? Number(s.price_output_per_1m) : null);
+  const cInP = mp.price_input_cached_per_1m != null ? Number(mp.price_input_cached_per_1m) : (inP != null ? inP : null);
+  if(inP == null && outP == null) return '<span class="mut">未设置</span>';
+  const txt = `输入 ¥${inP} / 缓存 ¥${cInP} / 输出 ¥${outP}`;
+  return hasOwn ? `<span title="该模型自定义价">${txt}</span>` : `<span class="mut" title="供应商默认价">${txt}</span>`;
+}
+function openModelPriceModal(model, supplier){
+  const modal = $('#modal');
+  api('/api/config').then(cfg => {
+    const mp = (cfg.model_prices || {})[model] || {};
+    const s = cfg.suppliers.find(x => x.name === supplier) || {};
+    const defIn = s.price_input_per_1m ? Number(s.price_input_per_1m) : '未设置';
+    const defOut = s.price_output_per_1m ? Number(s.price_output_per_1m) : '未设置';
+    const hasOwn = mp.price_input_per_1m != null || mp.price_output_per_1m != null || mp.price_input_cached_per_1m != null;
+    $('#modalTitle').textContent = '设置模型价格';
+    $('#modalBody').innerHTML = `
+      <div class="field"><label>模型</label><input value="${esc(model)}" disabled></div>
+      <div class="field"><label>输入价 / 缓存输入价 / 输出价（元/百万tokens，留空=用供应商默认）</label>
+        <div class="form-row" style="margin:0">
+          <input id="mpIn" type="number" step="0.01" min="0" placeholder="输入价" style="flex:1" value="${mp.price_input_per_1m != null ? mp.price_input_per_1m : ''}">
+          <input id="mpCIn" type="number" step="0.01" min="0" placeholder="缓存输入价" style="flex:1" value="${mp.price_input_cached_per_1m != null ? mp.price_input_cached_per_1m : ''}">
+          <input id="mpOut" type="number" step="0.01" min="0" placeholder="输出价" style="flex:1" value="${mp.price_output_per_1m != null ? mp.price_output_per_1m : ''}">
+        </div>
+      </div>
+      <div class="muted" style="margin:8px 0">供应商「${esc(supplier)}」默认价：输入 ${defIn}、输出 ${defOut}；缓存留空则按输入价算。</div>
+      <div class="form-row" style="margin-top:18px">
+        <button class="btn primary" id="mpSave">保存</button>
+        ${hasOwn ? '<button class="btn danger" id="mpClear">清除价格</button>' : ''}
+        <button class="btn ghost" id="mpCancel">取消</button>
+      </div>`;
+    modal.classList.remove('hidden');
+    $('#mpSave').onclick = async () => {
+      const data = {
+        model,
+        price_input_per_1m: $('#mpIn').value === '' ? null : Number($('#mpIn').value),
+        price_output_per_1m: $('#mpOut').value === '' ? null : Number($('#mpOut').value),
+        price_input_cached_per_1m: $('#mpCIn').value === '' ? null : Number($('#mpCIn').value),
+      };
+      try{ await api('/api/model-price', {method:'PUT', body: JSON.stringify(data)}); toast('已保存'); modal.classList.add('hidden'); loadMerged(); }
+      catch(e){ toast(e.message, 'bad'); }
+    };
+    const clearBtn = $('#mpClear');
+    if(clearBtn) clearBtn.onclick = async () => {
+      try{ await api('/api/model-price/' + encodeURIComponent(model), {method:'DELETE'}); toast('已恢复默认'); modal.classList.add('hidden'); loadMerged(); }
+      catch(e){ toast(e.message, 'bad'); }
+    };
+    $('#mpCancel').onclick = () => modal.classList.add('hidden');
+  }).catch(e => toast(e.message, 'bad'));
+}
+async function hideModel(supplier, model, isMap){
+  if(!confirm(`确定隐藏模型「${model}」？隐藏后它不再出现在列表，也不会被路由到。`)) return;
+  try{
+    if(isMap){ await api('/api/model_map/' + encodeURIComponent(model), {method:'DELETE'}); }
+    else { await api('/api/suppliers/' + encodeURIComponent(supplier) + '/models/' + encodeURIComponent(model), {method:'DELETE'}); }
+    toast('已隐藏'); loadMerged();
+  }catch(e){ toast(e.message, 'bad'); }
+}
+async function unhideAll(){
+  try{ await api('/api/unhide-models', {method:'POST'}); toast('已恢复全部隐藏模型'); loadMerged(); }
+  catch(e){ toast(e.message, 'bad'); }
+}
+// ---------- settings ----------
+async function loadSettings(){
+  try{
+    const cfg = await api('/api/config');
+    $('#setPort').value = cfg.port;
+    $('#setOpenBrowser').checked = cfg.open_browser;
+    $('#baseUrl').textContent = `http://127.0.0.1:${cfg.port}/v1`;
+    loadUpdateStatus();
+  }catch(e){}
+}
+async function saveSettings(){
+  try{
+    const cfg = await api('/api/config');
+    const oldPort = cfg.port;
+    cfg.port = Number($('#setPort').value) || 8765;
+    cfg.open_browser = $('#setOpenBrowser').checked;
+    await api('/api/config', {method:'PUT', body: JSON.stringify(cfg)});
+    $('#baseUrl').textContent = `http://127.0.0.1:${cfg.port}/v1`;
+    toast(cfg.port !== oldPort ? '已保存。端口将在退出软件并手动重新启动后生效' : '已保存');
+  }catch(e){ toast(e.message, 'bad'); }
+}
+async function loadUpdateStatus(){
+  try{
+    const st = await api('/api/update/status');
+    const status = $('#updateStatus');
+    const btn = $('#btnApplyUpdate');
+    if(!st.frozen){
+      status.textContent = '源码模式：请使用 apply-update.bat 手动更新';
+      btn.disabled = true;
+      return;
+    }
+    if(st.new_exe.exists){
+      const size = (st.new_exe.size / 1024 / 1024).toFixed(1) + ' MB';
+      const time = new Date(st.new_exe.mtime * 1000).toLocaleString('zh-CN', {hour12:false});
+      status.textContent = `版本 ${st.version}：发现新版 LLMRouter.new.exe（${size}，${time}，SHA256 ${st.new_exe.sha256.slice(0, 8)}...）`;
+      btn.disabled = false;
+    }else{
+      status.textContent = `版本 ${st.version}：未发现 LLMRouter.new.exe，请先构建并放置到同目录`;
+      btn.disabled = true;
+    }
+  }catch(e){
+    const status = $('#updateStatus');
+    if(status) status.textContent = '更新状态检查失败：' + e.message;
+  }
+}
+async function applyUpdate(){
+  if(!confirm('将替换 LLMRouter.exe 并自动重启，当前会话可能短暂断开，是否继续？')) return;
+  const btn = $('#btnApplyUpdate');
+  const status = $('#updateStatus');
+  btn.disabled = true;
+  status.textContent = '更新已启动，正在替换并重启...';
+  try{
+    await api('/api/update/apply', {method:'POST'});
+    for(let i = 0; i < 30; i++){
+      await new Promise(r => setTimeout(r, 2000));
+      try{
+        await api('/api/health');
+        status.textContent = '更新完成，网关已重新上线';
+        toast('更新完成，网关已重启');
+        return;
+      }catch(e){}
+    }
+    status.textContent = '更新已启动；如页面未自动恢复，请稍后刷新检查。';
+  }catch(e){
+    status.textContent = '更新启动失败：' + e.message;
+    btn.disabled = false;
+  }
+}
+// ---------- events & init ----------
+$('#btnAddSupplier').onclick = () => openSupplierModal(null);
+$('#btnRefreshSuppliers').onclick = loadSuppliers;
+$('#btnRefreshRecent').onclick = loadRecent;
+$('#chartFilter').addEventListener('change', e => {
+  chartModel = e.target.value;
+  recentPage = 1;
+  loadOverview(); loadRecent();
+});
+$('#timeFilter').addEventListener('change', e => {
+  const v = e.target.value;
+  if(v === 'custom'){ timeMode = 'custom'; timeHours = 24; }
+  else if(v === 'nhours'){ timeMode = 'nhours'; timeHours = clampHours($('#nHours').value); }
+  else { timeMode = 'hours'; timeHours = Number(v) || 24; }
+  applyTimePicker(v);
+  recentPage = 1;
+  loadOverview(); loadRecent();
+});
+$('#nHours').addEventListener('change', () => {
+  timeHours = clampHours($('#nHours').value);
+  $('#nHours').value = timeHours;
+  recentPage = 1;
+  loadOverview(); loadRecent();
+});
+$('#startTime').addEventListener('change', () => { recentPage = 1; loadOverview(); loadRecent(); });
+$('#endTime').addEventListener('change', () => { recentPage = 1; loadOverview(); loadRecent(); });
+$('#btnPagePrev').onclick = () => { if(recentPage > 1){ recentPage--; loadRecent(); } };
+$('#btnPageNext').onclick = () => { recentPage++; loadRecent(); };
+$('#btnTheme').onclick = () => {
+  const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+  applyTheme(next); toast(next === 'light' ? '已切换为浅色' : '已切换为深色');
+};
+$('#btnAddModel').onclick = async () => {
+  const model = $('#newModelName').value.trim();
+  if(!model){ toast('请输入模型名', 'bad'); return; }
+  try{
+    await api('/api/models', {method:'POST', body: JSON.stringify({model, supplier: $('#newModelSupplier').value, mode: $('#newModelMode').value})});
+    toast('已添加'); $('#newModelName').value = ''; loadModelsTab();
+  }catch(e){ toast(e.message, 'bad'); }
+};
+$('#btnSaveDefault').onclick = saveModelMap;
+$('#btnRefreshMerged').onclick = loadMerged;
+$('#btnFetchModels').onclick = async () => {
+  const b = $('#btnFetchModels'); b.disabled = true; b.textContent = '获取中…';
+  try{
+    const r = await api('/api/fetch-models', {method:'POST'});
+    toast(`已刷新 ${r.refreshed.length} 个供应商` + (r.failed.length ? `，${r.failed.length} 个失败（检查地址/Key）` : ''));
+    loadMerged();
+  }catch(e){ toast(e.message, 'bad'); }
+  finally{ b.disabled = false; b.textContent = '从上游获取'; }
+};
+$('#btnSaveSettings').onclick = saveSettings;
+$('#btnCheckUpdate').onclick = loadUpdateStatus;
+$('#btnApplyUpdate').onclick = applyUpdate;
+$('#btnCopyUrl').onclick = async () => {
+  const txt = $('#baseUrl').textContent.trim();
+  try{
+    await navigator.clipboard.writeText(txt);
+    toast('已复制：' + txt);
+  }catch(e){
+    const ta = document.createElement('textarea');
+    ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try{ document.execCommand('copy'); toast('已复制：' + txt); }
+    catch(e2){ toast('复制失败，请手动选中复制', 'bad'); }
+    ta.remove();
+  }
+};
+async function reloadGateway(btn){
+  btn.disabled = true; btn.classList.add('disabled');
+  const st = $('#statusText');
+  if(st) st.textContent = '加载中…';
+  try{
+    const result = await api('/api/reload', {method:'POST'});
+    toast(result.restart_required
+      ? '配置已加载；端口变更需退出软件并手动重新启动'
+      : '配置已重新加载');
+    await loadAll();
+  }catch(e){ toast(e.message, 'bad'); }
+  finally{
+    btn.disabled = false; btn.classList.remove('disabled');
+    checkHealth();
+  }
+}
+$('#btnReload').onclick = () => reloadGateway($('#btnReload'));
+$('#btnGateway').onclick = checkHealth;
+$('#btnClearStats').onclick = async () => {
+  if(!confirm('确定清空全部统计？此操作不可恢复。')) return;
+  try{ await api('/api/stats/clear', {method:'POST'}); toast('已清空'); loadOverview(); }catch(e){ toast(e.message, 'bad'); }
+};
+$('#btnExitApp').onclick = async () => {
+  if(!confirm('确定退出 LLM Router？')) return;
+  if(window.pywebview && window.pywebview.api && window.pywebview.api.exit_app){
+    try{ await window.pywebview.api.exit_app(); return; }catch(e){}
+  }
+  toast('浏览器模式请按 Ctrl+C 退出');
+};
+$('#modalClose').onclick = () => $('#modal').classList.add('hidden');
+$('#modal').addEventListener('click', e => { if(e.target === $('#modal')) $('#modal').classList.add('hidden'); });
+async function checkHealth(){
+  const g = $('#btnGateway');
+  try{
+    await api('/api/health');
+    $('#statusDot').className = 'dot ok';
+    $('#statusText').textContent = '网关运行中';
+    if(g) g.title = '网关运行中，点击重新检查';
+  }catch(e){
+    $('#statusDot').className = 'dot bad';
+    $('#statusText').textContent = '未连接（未启动？）';
+    if(g) g.title = '网关未连接，点击重新检查';
+  }
+}
+loadOverview(); loadRecent(); checkHealth();
+setInterval(() => { loadOverview(); loadRecent(); checkHealth(); }, 10000);
+</script>
+</body>
+</html>

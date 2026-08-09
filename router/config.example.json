@@ -1,0 +1,36 @@
+{
+  "port": 8765,
+  "open_browser": false,
+  "suppliers": [
+    {
+      "name": "responses-provider",
+      "base_url": "https://api.example.com/v1",
+      "api_key": "replace-me",
+      "wire_api": "responses",
+      "models": [],
+      "price_input_per_1m": 0,
+      "price_output_per_1m": 0
+    },
+    {
+      "name": "chat-provider",
+      "base_url": "https://api.example.com/v1",
+      "api_key": "replace-me",
+      "wire_api": "chat",
+      "models": [],
+      "price_input_per_1m": 0,
+      "price_output_per_1m": 0,
+      "image_handling": {
+        "deepseek-example": "vlm"
+      },
+      "vlm_supplier": "responses-provider",
+      "vlm_model": "gpt-5.6-luna",
+      "vlm_prompt_mode": "main-model"
+    }
+  ],
+  "model_map": {
+    "gpt-example": "responses-provider",
+    "deepseek-example": "chat-provider"
+  },
+  "default_supplier": "",
+  "model_blacklist": []
+}

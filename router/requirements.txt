@@ -1,0 +1,6 @@
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+httpx==0.28.1
+pywebview==6.2.1
+pystray==0.19.5
+Pillow==12.3.0
