@@ -67,6 +67,7 @@
 ## 协议兼容边界
 
 - Chat 上游只有在正确实现工具调用、流式增量和推理字段时，才能接近原生 Responses 体验。
+- Codex MultiAgent V2 会向第三方 Responses 上游发送 OpenAI 私有的 `agent_message.encrypted_content`。Router 不能解密它；非原生 OpenAI 上游应保持 `openai_sanitize` 为缺省 `true`，让 Router 在请求转发前降级为普通 user 文本。
 - `web_search` 等服务端托管工具需要独立后端，Router 不会伪造执行结果。
 - 未知密钥生成的 `agent_message.encrypted_content` 无法由 Router 解密。
 - 图片、音频和内嵌文件是否可用取决于上游能力；图片可通过 `image_handling` 配置为 `send-as-is`、`strip` 或 `vlm`，纯文本模型可用省略或视觉辅助描述继续处理图片。

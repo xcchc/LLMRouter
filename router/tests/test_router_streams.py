@@ -67,6 +67,65 @@ class RetryThenSuccessClient:
         pass
 
 
+class RetryThenSuccess429Client:
+    send_count = 0
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def build_request(self, method, url, **kwargs):
+        return httpx.Request(method, url, **kwargs)
+
+    async def send(self, request, stream=False):
+        type(self).send_count += 1
+        if type(self).send_count < 3:
+            return httpx.Response(
+                429,
+                request=request,
+                json={"error": {"message": "rate limited"}},
+            )
+        payload = (
+            b'data: {"choices":[{"index":0,"delta":{"content":"ok"},'
+            b'"finish_reason":"stop"}],"usage":{"prompt_tokens":1,'
+            b'"completion_tokens":1,"total_tokens":2}}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            stream=StaticStream(payload),
+        )
+
+    async def aclose(self):
+        pass
+
+
+class IncompleteResponseClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def build_request(self, method, url, **kwargs):
+        return httpx.Request(method, url, **kwargs)
+
+    async def send(self, request, stream=False):
+        payload = (
+            b'data: {"type":"response.incomplete","response":{'
+            b'"status":"incomplete","usage":{"input_tokens":2,'
+            b'"output_tokens":1,"total_tokens":3}}}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            stream=StaticStream(payload),
+        )
+
+    async def aclose(self):
+        pass
+
+
 class RouterStreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_relay_retries_two_upstream_500s_before_streaming_success(self):
         RetryThenSuccessClient.send_count = 0
@@ -104,6 +163,71 @@ class RouterStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["retry_count"], 2)
         self.assertEqual(records[0]["http_status"], 200)
+
+    async def test_relay_retries_two_upstream_429s_before_streaming_success(self):
+        RetryThenSuccess429Client.send_count = 0
+        records = []
+
+        async def find_supplier(_cfg, _model):
+            return {
+                "name": "chat-provider",
+                "base_url": "https://provider.example/v1",
+                "api_key": "test-key",
+                "wire_api": "chat",
+            }
+
+        async def no_sleep(_seconds):
+            pass
+
+        request = FakeRequest({
+            "model": "responses-model",
+            "input": "Say ok.",
+            "stream": True,
+        })
+        with (
+            patch.object(router, "load_config", return_value={}),
+            patch.object(router, "find_supplier", new=find_supplier),
+            patch.object(router.httpx, "AsyncClient", RetryThenSuccess429Client),
+            patch.object(router.asyncio, "sleep", new=no_sleep),
+            patch.object(router.stats, "record", side_effect=records.append),
+        ):
+            response = await router.relay(request, "responses")
+            body = b"".join([chunk async for chunk in response.body_iterator])
+
+        self.assertEqual(RetryThenSuccess429Client.send_count, 3)
+        self.assertIn(b'"type": "response.completed"', body)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["retry_count"], 2)
+        self.assertEqual(records[0]["http_status"], 200)
+
+    async def test_relay_records_incomplete_for_same_wire_sse(self):
+        records = []
+
+        async def find_supplier(_cfg, _model):
+            return {
+                "name": "responses-provider",
+                "base_url": "https://provider.example/v1",
+                "api_key": "test-key",
+                "wire_api": "responses",
+            }
+
+        request = FakeRequest({
+            "model": "responses-model",
+            "input": "Say partial.",
+            "stream": True,
+        })
+        with (
+            patch.object(router, "load_config", return_value={}),
+            patch.object(router, "find_supplier", new=find_supplier),
+            patch.object(router.httpx, "AsyncClient", IncompleteResponseClient),
+            patch.object(router.stats, "record", side_effect=records.append),
+        ):
+            response = await router.relay(request, "responses")
+            body = b"".join([chunk async for chunk in response.body_iterator])
+
+        self.assertIn(b'"type":"response.incomplete"', body)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "incomplete")
 
     async def test_gzip_sse_is_decoded_before_parsing(self):
         response = httpx.Response(
@@ -638,6 +762,81 @@ class RouterRequestConversionTests(unittest.TestCase):
         )
         self.assertNotIn("reasoning", message)
 
+    def test_sanitizer_converts_agent_message_and_removes_encrypted_content(self):
+        original = {
+            "model": "responses-model",
+            "input": [
+                {
+                    "type": "agent_message",
+                    "author": "subagent",
+                    "content": [
+                        {"type": "input_text", "text": "Message Type: NEW_TASK ... Payload:\n"},
+                        {"type": "encrypted_content", "encrypted_content": "opaque-ciphertext"},
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Original user."}],
+                },
+            ],
+        }
+
+        sanitized = router._sanitize_responses_for_non_openai(original)
+
+        self.assertEqual(original["input"][0]["type"], "agent_message")
+        self.assertNotIn("opaque-ciphertext", json.dumps(sanitized, ensure_ascii=False))
+        self.assertNotIn("encrypted_content", json.dumps(sanitized, ensure_ascii=False))
+        first = sanitized["input"][0]
+        self.assertEqual(first["type"], "message")
+        self.assertEqual(first["role"], "user")
+        self.assertIn("NEW_TASK", first["content"][0]["text"])
+        self.assertIn(router._OPENAI_ENCRYPTED_PLACEHOLDER, first["content"][0]["text"])
+        self.assertEqual(sanitized["input"][1], original["input"][1])
+
+    def test_sanitizer_replaces_encrypted_content_parts_in_standard_messages(self):
+        original = {
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Hello"},
+                    {"type": "encrypted_content", "encrypted_content": "opaque-ciphertext"},
+                ],
+            }],
+        }
+
+        sanitized = router._sanitize_responses_for_non_openai(original)
+        content = sanitized["input"][0]["content"]
+
+        self.assertEqual(
+            content,
+            [
+                {"type": "input_text", "text": "Hello"},
+                {"type": "input_text", "text": router._OPENAI_ENCRYPTED_PLACEHOLDER},
+            ],
+        )
+
+    def test_openai_sanitize_default_and_override(self):
+        self.assertTrue(router._should_sanitize_openai_fields({
+            "wire_api": "responses",
+            "base_url": "https://provider.example/v1",
+        }))
+        self.assertFalse(router._should_sanitize_openai_fields({
+            "wire_api": "responses",
+            "base_url": "https://api.openai.com/v1",
+        }))
+        self.assertFalse(router._should_sanitize_openai_fields({
+            "wire_api": "responses",
+            "base_url": "https://provider.example/v1",
+            "openai_sanitize": False,
+        }))
+        self.assertTrue(router._should_sanitize_openai_fields({
+            "wire_api": "responses",
+            "base_url": "https://api.openai.com/v1",
+            "openai_sanitize": True,
+        }))
+
 
 class ChatCompatibilityFallbackTests(unittest.TestCase):
     def test_thinking_tool_choice_falls_back_to_auto_with_system_requirement(self):
@@ -1030,6 +1229,42 @@ class ChatToResponsesTests(unittest.TestCase):
         self.assertEqual(item_done["item"]["execution"], "client")
         self.assertEqual(item_done["item"]["arguments"]["limit"], 8)
         self.assertNotIn("name", item_done["item"])
+
+
+class UsageSnifferTests(unittest.TestCase):
+    def test_sniffs_failed_incomplete_and_completed_statuses(self):
+        failed = router.UsageSniffer()
+        failed.feed(b'data: {"type":"response.failed"}\n\n')
+        self.assertEqual(failed.status, "failed")
+
+        incomplete = router.UsageSniffer()
+        incomplete.feed(b'data: {"type":"response.incomplete"}\n\n')
+        self.assertEqual(incomplete.status, "incomplete")
+
+        completed = router.UsageSniffer()
+        completed.feed(
+            b'data: {"type":"response.completed","response":{'
+            b'"status":"completed","usage":{"total_tokens":5}}}\n\n'
+        )
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(completed.usage["total_tokens"], 5)
+
+
+class ResponsesToChatTests(unittest.TestCase):
+    def test_incomplete_terminal_event_marks_length_finish_reason(self):
+        converter = router.ResponsesToChat("responses-model")
+        converter.on_event({
+            "type": "response.incomplete",
+            "response": {
+                "status": "incomplete",
+                "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+            },
+        })
+
+        final = converter.final_chunk()
+
+        self.assertEqual(final["choices"][0]["finish_reason"], "length")
+        self.assertEqual(final["usage"]["total_tokens"], 5)
 
 
 if __name__ == "__main__":

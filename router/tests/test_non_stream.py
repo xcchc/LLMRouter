@@ -89,6 +89,37 @@ class NonStreamRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(json.loads(StaticJsonClient.requests[0].content)["stream"])
         self.assertEqual(records[0]["total_tokens"], 5)
 
+    async def test_same_wire_responses_sanitizes_agent_message_for_third_party(self):
+        raw_body = b'{"object":"response","status":"completed"}'
+        request_body = {
+            "model": "same-model",
+            "stream": False,
+            "input": [{
+                "type": "agent_message",
+                "author": "subagent",
+                "content": [
+                    {"type": "input_text", "text": "Message Type: NEW_TASK ... Payload:\n"},
+                    {"type": "encrypted_content", "encrypted_content": "opaque-ciphertext"},
+                ],
+            }],
+        }
+
+        response, _records = await self._relay(
+            "responses",
+            "responses",
+            request_body,
+            raw_body,
+        )
+
+        sent = json.loads(StaticJsonClient.requests[0].content)
+        self.assertNotIn("encrypted_content", json.dumps(sent))
+        self.assertNotIn("opaque-ciphertext", json.dumps(sent))
+        item = sent["input"][0]
+        self.assertEqual(item["type"], "message")
+        self.assertEqual(item["role"], "user")
+        self.assertIn(router._OPENAI_ENCRYPTED_PLACEHOLDER, item["content"][0]["text"])
+        self.assertEqual(response.body, raw_body)
+
     async def test_chat_json_is_converted_to_non_stream_responses_json(self):
         upstream = {
             "id": "chatcmpl_upstream",

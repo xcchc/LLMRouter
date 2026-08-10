@@ -10,6 +10,7 @@
 用法：编辑 config.json 后双击 start.bat 启动。
 """
 import asyncio
+import copy
 import json
 import hashlib
 import os
@@ -227,6 +228,83 @@ def _content_to_text(content) -> str:
                     parts.append(f"[文件: {c.get('filename') or c.get('file_id') or '附件'}]")
         return "\n\n".join(p for p in parts if p)
     return str(content)
+
+
+_OPENAI_ENCRYPTED_PLACEHOLDER = (
+    "[Encrypted agent payload was removed by the router because this upstream "
+    "cannot decrypt it.]"
+)
+
+
+def _is_openai_native_supplier(supplier: dict) -> bool:
+    base = str(supplier.get("base_url") or "").lower()
+    return "openai.com" in base or "chatgpt.com" in base
+
+
+def _should_sanitize_openai_fields(supplier: dict) -> bool:
+    configured = supplier.get("openai_sanitize")
+    if isinstance(configured, bool):
+        return configured
+    if configured is not None:
+        return bool(configured)
+    return str(supplier.get("wire_api", "responses")).lower() == "responses" and not _is_openai_native_supplier(supplier)
+
+
+def _contains_encrypted_content(value) -> bool:
+    if isinstance(value, list):
+        return any(_contains_encrypted_content(item) for item in value)
+    if isinstance(value, dict):
+        if value.get("type") == "encrypted_content" or value.get("encrypted_content") is not None:
+            return True
+        return any(_contains_encrypted_content(item) for item in value.values())
+    return False
+
+
+def _sanitize_responses_for_non_openai(body: dict) -> dict:
+    """Replace OpenAI-only agent/encrypted fields before forwarding to a third-party Responses backend."""
+    if not isinstance(body, dict):
+        return body
+
+    sanitized = copy.deepcopy(body)
+    changed = False
+    input_items = sanitized.get("input")
+    if isinstance(input_items, list):
+        for item in input_items:
+            if not isinstance(item, dict) or item.get("type") != "agent_message":
+                continue
+            content = item.get("content")
+            text = _content_to_text(content)
+            if _contains_encrypted_content(item):
+                text = f"{text}\n{_OPENAI_ENCRYPTED_PLACEHOLDER}".strip()
+            item["type"] = "message"
+            item["role"] = "user"
+            item["content"] = [{"type": "input_text", "text": text or "Agent message content is unavailable."}]
+            changed = True
+
+    def strip_encrypted(value, in_content=False):
+        nonlocal changed
+        if isinstance(value, list):
+            out = []
+            for entry in value:
+                if isinstance(entry, dict) and entry.get("type") == "encrypted_content":
+                    changed = True
+                    if in_content:
+                        out.append({"type": "input_text", "text": _OPENAI_ENCRYPTED_PLACEHOLDER})
+                    continue
+                out.append(strip_encrypted(entry, in_content))
+            return out
+        if isinstance(value, dict):
+            out = {}
+            for key, entry in value.items():
+                if key == "encrypted_content":
+                    changed = True
+                    continue
+                out[key] = strip_encrypted(entry, in_content or key == "content")
+            return out
+        return value
+
+    sanitized = strip_encrypted(sanitized)
+    return sanitized if changed else body
 
 
 def _responses_content_to_chat(content):
@@ -963,8 +1041,13 @@ class UsageSniffer:
                 continue
             if not isinstance(obj, dict):
                 continue
-            if obj.get("type") == "response.failed":
+            terminal_type = obj.get("type")
+            if terminal_type == "response.failed":
                 self.status = "failed"
+            elif terminal_type == "response.incomplete":
+                self.status = "incomplete"
+            elif terminal_type == "response.completed" and isinstance(obj.get("response"), dict):
+                self.status = obj["response"].get("status", "completed")
             u = obj.get("usage")
             if u is None and isinstance(obj.get("response"), dict):
                 u = obj["response"].get("usage")
@@ -1620,9 +1703,9 @@ class ResponsesToChat:
                 if tool_input is None:
                     tool_input = "".join(rec["custom_input_parts"])
                 self._emit_arguments(rec, _custom_tool_arguments(tool_input), events)
-        elif t == "response.completed":
+        elif t in ("response.completed", "response.incomplete"):
             resp_obj = evt.get("response") or {}
-            self.status = resp_obj.get("status", "completed")
+            self.status = resp_obj.get("status", "incomplete" if t == "response.incomplete" else "completed")
             self.usage = resp_obj.get("usage")
             for item in resp_obj.get("output") or []:
                 if isinstance(item, dict):
@@ -2037,6 +2120,8 @@ async def relay(request: Request, incoming_wire: str):
 
     if incoming_wire == upstream_wire:
         out_body = body
+        if incoming_wire == "responses" and _should_sanitize_openai_fields(supplier):
+            out_body = _sanitize_responses_for_non_openai(out_body)
     elif incoming_wire == "responses":
         out_body = responses_to_chat(body, tool_bridge=tool_bridge)
     else:
@@ -2092,7 +2177,7 @@ async def relay(request: Request, incoming_wire: str):
                 rec["retry_count"] += 1
                 continue
             break
-        if resp.status_code >= 500 and transport_retries < 2:
+        if (resp.status_code == 429 or resp.status_code >= 500) and transport_retries < 2:
             await resp.aread()
             await resp.aclose()
             resp = None
@@ -2169,8 +2254,8 @@ async def relay(request: Request, incoming_wire: str):
 
             if isinstance(result_json, dict):
                 _update_record_usage(rec, result_json.get("usage"))
-                if rec["status"] == "ok" and result_json.get("status") == "failed":
-                    rec["status"] = "failed"
+                if rec["status"] == "ok" and result_json.get("status") in ("failed", "incomplete"):
+                    rec["status"] = result_json["status"]
             rec["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
             stats.record(rec)
             return result
@@ -2215,8 +2300,8 @@ async def relay(request: Request, incoming_wire: str):
         finally:
             u = sniffer.usage
             _update_record_usage(rec, u)
-            if rec["status"] == "ok" and sniffer.status == "failed":
-                rec["status"] = "failed"
+            if rec["status"] == "ok" and sniffer.status in ("failed", "incomplete"):
+                rec["status"] = sniffer.status
             rec["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
             stats.record(rec)
             await resp.aclose()
@@ -2253,6 +2338,8 @@ def validate_supplier(s: dict) -> str | None:
         return f"供应商 {s.get('name')} 的 wire_api 只能是 responses 或 chat"
     if s.get("vlm_prompt_mode") not in (None, "", "main-model", "template"):
         return f"供应商 {s.get('name')} 的 vlm_prompt_mode 只能是 main-model 或 template"
+    if s.get("openai_sanitize") is not None and not isinstance(s.get("openai_sanitize"), bool):
+        return f"供应商 {s.get('name')} 的 openai_sanitize 必须是布尔值"
     image_handling = s.get("image_handling")
     if image_handling is not None:
         if isinstance(image_handling, str):

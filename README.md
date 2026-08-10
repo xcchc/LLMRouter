@@ -12,7 +12,8 @@ LLM Router 是一个本地 OpenAI 兼容路由网关。Codex++ 只需要连接�
 - 在 Responses 与 Chat 协议之间转换文本、推理内容、用量统计、图片输入和 JSON Schema 输出格式。
 - 支持为纯文本模型配置图片省略（`strip`）或视觉模型描述辅助（`vlm`）。
 - 桥接 function、custom、namespace 和 tool search 工具调用。
-- 在响应开始前对网络错误和临时上游 5xx 做有限重试。
+- 在响应开始前对网络错误、429 和临时上游 5xx 做有限重试。
+- 对非原生 OpenAI Responses 上游默认清洗 Codex 的 `agent_message` / `encrypted_content`，避免把无法解密的 OpenAI 私有字段原样转发。
 - 提供本地管理界面，用于维护供应商、模型路由、价格和运行统计。
 
 ## 目录结构
@@ -70,6 +71,7 @@ Copy-Item config.example.json config.json
 - `open_browser`：是否使用浏览器模式。
 - `suppliers`：上游供应商列表，包含名称、接口地址、API Key、协议和可选模型列表。
 - `wire_api`：上游协议，可选 `responses` 或 `chat`。
+- `openai_sanitize`：是否在转发到非原生 OpenAI Responses 上游前清理 Codex 的 `agent_message` / `encrypted_content`；缺省为 `true`。
 - `model_map`：模型名到供应商名的显式映射。
 - `default_supplier`：没有显式映射时使用的默认供应商。
 - `model_blacklist`：不在合并模型列表中展示的模型。

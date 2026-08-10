@@ -12,19 +12,19 @@ LLM Router 是一个本地 OpenAI 兼容路由网关。Codex++ 只需要连接�
 - 在 Responses 与 Chat 协议之间转换文本、推理内容、用量统计、图片输入和 JSON Schema 输出格式。
 - 支持为纯文本模型配置图片省略（strip）或视觉模型描述辅助（VLM）。
 - 桥接 function、custom、namespace 和 tool search 工具调用，并尽量还原 Codex 的过程折叠、文件修改卡和 diff 展示。
-- 在响应开始前对网络错误和临时上游 5xx 做有限重试。
+- 在响应开始前对网络错误、429 和临时上游 5xx 做有限重试。
 - 提供本地管理界面，用于维护供应商、模型路由、价格与运行统计。
 
 ## 兼容性说明
 
 Router 的目标是让 DeepSeek 和其他 Chat 协议模型在 Codex 中尽可能接近原生 GPT 模型的体验，但最终效果仍取决于上游模型和供应商是否正确支持工具调用、流式输出、推理字段及结构化输出。
 
-已经通过真实 DeepSeek Chat 上游验证的路径包括：reasoning、commentary/final phase、function、custom `apply_patch`、namespace、延迟 `tool_search`、工具续轮、文件修改卡、JSON Schema 回退和临时 5xx 重试。
+已经通过真实 DeepSeek Chat 上游验证的路径包括：reasoning、commentary/final phase、function、custom `apply_patch`、namespace、延迟 `tool_search`、工具续轮、文件修改卡、JSON Schema 回退和临时 5xx / 429 重试。
 
 以下能力不能仅靠协议转换完整复刻：
 
+- Codex MultiAgent V2 的 `agent_message.encrypted_content` 无法由 Router 解密。对非原生 OpenAI Responses 上游，Router 默认开启 `openai_sanitize`，把 `agent_message` 转成普通 user 文本，并把无法解密的密文移除或替换为占位说明；只有确认上游能处理这些原生字段时才应关闭。
 - `web_search` 等由 OpenAI 服务端执行的托管工具，需要额外接入真实的搜索或工具后端。Router 只会向上游说明能力限制，不会伪造成功结果。
-- `agent_message.encrypted_content` 需要生成它的后端或客户端密钥才能解密。Router 无法恢复未知密钥加密的正文。
 - 某些 Chat 上游不接受强制 `tool_choice`，或会返回非标准工具调用字段。这类差异需要由具体供应商适配。
 - 图片会映射为 Chat `image_url`。Router 支持按模型配置三种处理模式：`send-as-is` 原样发送、`strip` 替换为文本占位、`vlm` 先交给视觉辅助供应商生成描述再注入请求。仅接受文本的模型应使用 `strip` 或 `vlm`。
 - Responses 的内嵌文件和音频没有通用的 Chat 等价格式，目前不能保证保真转换。Codex 读取本地文件时应优先使用客户端文件工具。
@@ -65,6 +65,7 @@ Copy-Item config.example.json config.json
 - `open_browser`：是否使用浏览器模式。
 - `suppliers`：供应商列表，包含名称、接口地址、API Key、上游协议和可选模型列表。
 - `wire_api`：上游协议，可选 `responses` 或 `chat`。
+- `openai_sanitize`：是否在转发到非原生 OpenAI Responses 上游前清理 Codex 的 `agent_message` / `encrypted_content`；缺省为 `true`，仅对 Responses 上游生效。
 - `image_handling`：供应商内按模型名配置图片处理模式，取值为 `send-as-is`、`strip` 或 `vlm`；缺省为 `send-as-is`。
 - `vlm_supplier`：`vlm` 模式使用的视觉辅助供应商名称，复用其 `base_url` 和 `api_key`。
 - `vlm_model`：视觉辅助供应商使用的视觉模型名，例如 `gpt-5.6-luna`。

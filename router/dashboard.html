@@ -266,6 +266,7 @@ async function api(path, opts={}){
 }
 function statusBadge(st){
   if(st === 'ok') return '<span class="badge ok">成功</span>';
+  if(st === 'incomplete') return '<span class="badge">未完成</span>';
   if(st === 'failed') return '<span class="badge bad">失败</span>';
   return '<span class="badge bad">错误</span>';
 }
@@ -463,12 +464,14 @@ async function loadSuppliers(){
       const vlmCount = imageModes.filter(v => v === 'vlm').length;
       const stripCount = imageModes.filter(v => v === 'strip').length;
       const imageSummary = [vlmCount ? `VLM ${vlmCount}` : '', stripCount ? `省略 ${stripCount}` : ''].filter(Boolean).join(' · ') || '全部原样发送';
+      const sanitizeText = s.openai_sanitize === false ? '原样透传' : (s.openai_sanitize === true ? '始终清洗' : '自动清洗');
       return `<div class="card supplier-card">
         <div class="head"><span class="name">${esc(s.name)}</span><span class="badge ${s.wire_api === 'chat' ? 'chat' : ''}">${esc(s.wire_api || 'responses')}</span>${cfg.default_supplier === s.name ? '<span class="badge mut">默认</span>' : ''}</div>
         <div class="row">地址：<b>${esc(s.base_url)}</b></div>
         <div class="row">Key：<b>${key}</b></div>
         <div class="row">手动模型：<b>${(s.models || []).length} 个</b>（其余自动获取）</div>
         <div class="row">图片处理：<b>${imageSummary}</b>${vlmCount && s.vlm_supplier ? ' · ' + esc(s.vlm_supplier) + ' / ' + esc(s.vlm_model || '') + ' · ' + (s.vlm_prompt_mode === 'template' ? '内置模板' : '主模型规划') : ''}</div>
+        <div class="row">Codex 加密字段：<b>${sanitizeText}</b></div>
         <div class="row">隐藏模型：<b>${((cfg.model_blacklist || {})[s.name] || []).length} 个</b>（模型列表里"隐藏"的）</div>
         <div class="row">价格：<b>${price}</b>（元/百万tokens，可选）</div>
         <div class="ops">
@@ -523,6 +526,11 @@ function openSupplierModal(name){
       <div class="field"><label>协议</label><select id="fWire">
         <option value="responses" ${s && s.wire_api === 'chat' ? '' : 'selected'}>responses（OpenAI Responses 接口）</option>
         <option value="chat" ${s && s.wire_api === 'chat' ? 'selected' : ''}>chat（Chat Completions 接口）</option>
+      </select></div>
+      <div class="field"><label>Codex 加密字段</label><select id="fSanitize">
+        <option value="auto" ${!s || s.openai_sanitize == null ? 'selected' : ''}>自动（非原生 OpenAI 上游清洗）</option>
+        <option value="true" ${s && s.openai_sanitize === true ? 'selected' : ''}>始终清洗</option>
+        <option value="false" ${s && s.openai_sanitize === false ? 'selected' : ''}>原样透传</option>
       </select></div>
       <div class="field"><label>手动模型列表（可选，每行一个；留空则自动从上游获取）</label><textarea id="fModels" placeholder="gpt-5.6-sol&#10;deepseek-v4-flash">${esc((s && s.models || []).join('\n'))}</textarea></div>
       <div class="field"><label>图片处理模式（按模型选择；选择 VLM 后可设置视觉辅助供应商和视觉模型）</label><div id="fImageModeRows"></div></div>
@@ -638,6 +646,8 @@ function openSupplierModal(name){
         price_output_per_1m: Number($('#fPOut').value) || 0,
         price_input_cached_per_1m: Number($('#fCIn').value) || 0,
       };
+      const sanitizeMode = $('#fSanitize').value;
+      if(sanitizeMode !== 'auto') data.openai_sanitize = sanitizeMode === 'true';
       if(!data.name || !data.base_url){ toast('名称和接口地址不能为空', 'bad'); return; }
       if(Object.values(data.image_handling).includes('vlm') && (!data.vlm_supplier || !data.vlm_model)){
         toast('选择 VLM 后，请同时选择视觉辅助供应商和视觉模型', 'bad'); return;
