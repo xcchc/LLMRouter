@@ -87,6 +87,36 @@ Copy-Item config.example.json config.json
 
 切换模型时，Router 根据 `model_map`、供应商模型列表和 `default_supplier` 选择上游。
 
+## 更新
+
+### 构建更新包
+
+```powershell
+git clone https://github.com/xcchc/LLMRouter.git
+cd LLMRouter\router
+.\build.bat
+```
+
+构建完成后会生成两个文件：
+
+- `router\dist\LLMRouter.exe`：可用于发布的新版完整程序。
+- `router\LLMRouter.new.exe`：设置页“更新并重启”可直接识别的更新包。
+
+`LLMRouter.new.exe` 不会进入 Git 仓库，`build.bat` 只在本地生成它，避免直接替换正在运行的旧版。
+
+### 在设置页更新
+
+1. 打开运行中 Router 的管理界面，例如 `http://127.0.0.1:8765/`。
+2. 进入“设置”，打开“更新”卡片。
+3. 点击“检查更新”，确认提示已经找到 `LLMRouter.new.exe`。
+4. 点击“更新并重启”，程序会自动替换 `LLMRouter.exe` 并启动新版。
+
+如果运行的是源码模式而不是 EXE，请使用 `router\apply-update.bat` 手动兜底替换。
+
+### 发布给其他用户
+
+需要分发时，把 `router\dist\LLMRouter.exe` 上传到 GitHub Releases。使用者下载后，将其放到正在运行的 Router 同目录并命名为 `LLMRouter.new.exe`，然后按上面的设置页步骤更新。
+
 ## API
 
 对外 API：

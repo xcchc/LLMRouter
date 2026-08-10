@@ -45,7 +45,7 @@ else:
 CONFIG_PATH = BASE_DIR / "config.json"
 DASHBOARD_PATH = _DATA_DIR / "dashboard.html"
 MODEL_CACHE_TTL = 600  # 上游模型列表缓存秒数
-APP_VERSION = "2026.08.05"
+APP_VERSION = "2026.08.10"
 
 app = FastAPI(title="LLM Router", docs_url=None, redoc_url=None)
 

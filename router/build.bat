@@ -17,9 +17,13 @@ if errorlevel 1 goto :failed
 .venv\Scripts\python.exe -m PyInstaller --noconfirm --clean LLMRouter.spec
 if errorlevel 1 goto :failed
 
+copy /b /y "dist\LLMRouter.exe" "LLMRouter.new.exe" >nul
+if errorlevel 1 goto :failed
+
 echo.
 echo Build completed: dist\LLMRouter.exe
-echo Close the running LLMRouter.exe before replacing the root executable.
+echo Update package staged: LLMRouter.new.exe
+echo Open the dashboard Settings -> Update, then click Update and restart.
 exit /b 0
 
 :failed
