@@ -829,6 +829,32 @@ class RouterRequestConversionTests(unittest.TestCase):
         self.assertEqual(first["content"][1]["text"], "REPRO-TOKEN-1234")
         self.assertEqual(sanitized["input"][1], original["input"][1])
 
+    def test_sanitizer_strips_author_and_recipient_from_standard_messages(self):
+        original = {
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "author": "/root/pdf_visual_analysis",
+                    "recipient": "/root",
+                    "content": [{"type": "input_text", "text": "Agent FINAL_ANSWER"}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "继续"}],
+                },
+            ],
+        }
+
+        sanitized = router._sanitize_responses_for_non_openai(original)
+
+        for item in sanitized["input"]:
+            self.assertNotIn("author", item)
+            self.assertNotIn("recipient", item)
+        self.assertEqual(sanitized["input"][0]["content"][0]["text"], "Agent FINAL_ANSWER")
+        self.assertEqual(sanitized["input"][1], original["input"][1])
+
     def test_sanitizer_replaces_encrypted_content_parts_in_standard_messages(self):
         original = {
             "input": [{

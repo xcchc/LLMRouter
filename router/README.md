@@ -23,7 +23,7 @@ Router 的目标是让 DeepSeek 和其他 Chat 协议模型在 Codex 中尽可�
 
 以下能力不能仅靠协议转换完整复刻：
 
-- Codex MultiAgent V2 会把子代理任务放进 `agent_message.encrypted_content`。真实 DeepSeek 抓包中该字段就是任务明文，因此 Router 默认把 `agent_message` 转成普通 user 消息，并把 `encrypted_content` 解包为 `input_text`；只有遇到确实无法解包的 OpenAI 私有密文时才替换为占位说明。非原生 OpenAI Responses 上游应保持 `openai_sanitize` 为缺省 `true`。
+- Codex MultiAgent V2 会把子代理任务放进 `agent_message.encrypted_content`。真实 DeepSeek 抓包中该字段就是任务明文，因此 Router 默认把 `agent_message` 转成普通 user 消息，并把 `encrypted_content` 解包为 `input_text`；新版 Codex 也可能直接以 `message + author/recipient` 形式出现，Router 会一并移除这些路由字段，避免部分第三方 Responses 上游返回 502。只有遇到确实无法解包的 OpenAI 私有密文时才替换为占位说明。非原生 OpenAI Responses 上游应保持 `openai_sanitize` 为缺省 `true`。
 - `web_search` 等由 OpenAI 服务端执行的托管工具，需要额外接入真实的搜索或工具后端。Router 只会向上游说明能力限制，不会伪造成功结果。
 - 某些 Chat 上游不接受强制 `tool_choice`，或会返回非标准工具调用字段。这类差异需要由具体供应商适配。
 - 图片会映射为 Chat `image_url`。Router 支持按模型配置三种处理模式：`send-as-is` 原样发送、`strip` 替换为文本占位、`vlm` 先交给视觉辅助供应商生成描述再注入请求。仅接受文本的模型应使用 `strip` 或 `vlm`。

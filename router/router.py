@@ -279,6 +279,10 @@ def _sanitize_responses_for_non_openai(body: dict) -> dict:
         for item in input_items:
             if not isinstance(item, dict):
                 continue
+            for key in ("author", "recipient"):
+                if key in item:
+                    del item[key]
+                    changed = True
             content = item.get("content")
             unwrapped = _unwrap_encrypted_content_parts(content)
             if item.get("type") == "agent_message":

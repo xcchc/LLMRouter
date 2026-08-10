@@ -13,7 +13,7 @@ LLM Router 是一个本地 OpenAI 兼容路由网关。Codex++ 只需要连接�
 - 支持为纯文本模型配置图片省略（`strip`）或视觉模型描述辅助（`vlm`）。
 - 桥接 function、custom、namespace 和 tool search 工具调用。
 - 在响应开始前对网络错误、429 和临时上游 5xx 做有限重试。
-- 对非原生 OpenAI Responses 上游默认把 Codex 的 `agent_message` 转成普通 user 消息，并把 `encrypted_content` 中的任务文本解包为 `input_text`；无法解包的私有字段会降级为占位文本。
+- 对非原生 OpenAI Responses 上游默认把 Codex 的 `agent_message` 转成普通 user 消息，把 `encrypted_content` 中的任务文本解包为 `input_text`，并移除 `author` / `recipient` 等 Codex 路由字段；无法解包的私有字段会降级为占位文本。
 - 提供本地管理界面，用于维护供应商、模型路由、价格和运行统计。
 
 ## 目录结构
