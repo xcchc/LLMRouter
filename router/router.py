@@ -250,14 +250,21 @@ def _should_sanitize_openai_fields(supplier: dict) -> bool:
     return str(supplier.get("wire_api", "responses")).lower() == "responses" and not _is_openai_native_supplier(supplier)
 
 
-def _contains_encrypted_content(value) -> bool:
-    if isinstance(value, list):
-        return any(_contains_encrypted_content(item) for item in value)
-    if isinstance(value, dict):
-        if value.get("type") == "encrypted_content" or value.get("encrypted_content") is not None:
-            return True
-        return any(_contains_encrypted_content(item) for item in value.values())
-    return False
+def _unwrap_encrypted_content_parts(content):
+    """Convert encrypted_content parts into input_text for third-party Responses backends."""
+    if not isinstance(content, list):
+        return content
+    out = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "encrypted_content":
+            payload = part.get("encrypted_content")
+            if isinstance(payload, str) and payload:
+                out.append({"type": "input_text", "text": payload})
+            else:
+                out.append({"type": "input_text", "text": _OPENAI_ENCRYPTED_PLACEHOLDER})
+        else:
+            out.append(part)
+    return out
 
 
 def _sanitize_responses_for_non_openai(body: dict) -> dict:
@@ -270,16 +277,20 @@ def _sanitize_responses_for_non_openai(body: dict) -> dict:
     input_items = sanitized.get("input")
     if isinstance(input_items, list):
         for item in input_items:
-            if not isinstance(item, dict) or item.get("type") != "agent_message":
+            if not isinstance(item, dict):
                 continue
             content = item.get("content")
-            text = _content_to_text(content)
-            if _contains_encrypted_content(item):
-                text = f"{text}\n{_OPENAI_ENCRYPTED_PLACEHOLDER}".strip()
-            item["type"] = "message"
-            item["role"] = "user"
-            item["content"] = [{"type": "input_text", "text": text or "Agent message content is unavailable."}]
-            changed = True
+            unwrapped = _unwrap_encrypted_content_parts(content)
+            if item.get("type") == "agent_message":
+                if not isinstance(unwrapped, list) or not unwrapped:
+                    unwrapped = [{"type": "input_text", "text": _content_to_text(content) or "Agent message content is unavailable."}]
+                item["type"] = "message"
+                item["role"] = "user"
+                item["content"] = unwrapped
+                changed = True
+            elif isinstance(unwrapped, list) and unwrapped != content:
+                item["content"] = unwrapped
+                changed = True
 
     def strip_encrypted(value, in_content=False):
         nonlocal changed

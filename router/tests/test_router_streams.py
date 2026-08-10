@@ -762,7 +762,7 @@ class RouterRequestConversionTests(unittest.TestCase):
         )
         self.assertNotIn("reasoning", message)
 
-    def test_sanitizer_converts_agent_message_and_removes_encrypted_content(self):
+    def test_sanitizer_converts_agent_message_and_unwraps_encrypted_content(self):
         original = {
             "model": "responses-model",
             "input": [
@@ -771,7 +771,7 @@ class RouterRequestConversionTests(unittest.TestCase):
                     "author": "subagent",
                     "content": [
                         {"type": "input_text", "text": "Message Type: NEW_TASK ... Payload:\n"},
-                        {"type": "encrypted_content", "encrypted_content": "opaque-ciphertext"},
+                        {"type": "encrypted_content", "encrypted_content": "REPRO-TOKEN-1234"},
                     ],
                 },
                 {
@@ -785,13 +785,13 @@ class RouterRequestConversionTests(unittest.TestCase):
         sanitized = router._sanitize_responses_for_non_openai(original)
 
         self.assertEqual(original["input"][0]["type"], "agent_message")
-        self.assertNotIn("opaque-ciphertext", json.dumps(sanitized, ensure_ascii=False))
+        self.assertIn("REPRO-TOKEN-1234", json.dumps(sanitized, ensure_ascii=False))
         self.assertNotIn("encrypted_content", json.dumps(sanitized, ensure_ascii=False))
         first = sanitized["input"][0]
         self.assertEqual(first["type"], "message")
         self.assertEqual(first["role"], "user")
         self.assertIn("NEW_TASK", first["content"][0]["text"])
-        self.assertIn(router._OPENAI_ENCRYPTED_PLACEHOLDER, first["content"][0]["text"])
+        self.assertEqual(first["content"][1]["text"], "REPRO-TOKEN-1234")
         self.assertEqual(sanitized["input"][1], original["input"][1])
 
     def test_sanitizer_replaces_encrypted_content_parts_in_standard_messages(self):
@@ -801,7 +801,7 @@ class RouterRequestConversionTests(unittest.TestCase):
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": "Hello"},
-                    {"type": "encrypted_content", "encrypted_content": "opaque-ciphertext"},
+                    {"type": "encrypted_content", "encrypted_content": "REPRO-TOKEN-5678"},
                 ],
             }],
         }
@@ -813,8 +813,27 @@ class RouterRequestConversionTests(unittest.TestCase):
             content,
             [
                 {"type": "input_text", "text": "Hello"},
-                {"type": "input_text", "text": router._OPENAI_ENCRYPTED_PLACEHOLDER},
+                {"type": "input_text", "text": "REPRO-TOKEN-5678"},
             ],
+        )
+
+    def test_sanitizer_uses_placeholder_for_non_string_encrypted_content(self):
+        original = {
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "encrypted_content", "encrypted_content": None},
+                ],
+            }],
+        }
+
+        sanitized = router._sanitize_responses_for_non_openai(original)
+        content = sanitized["input"][0]["content"]
+
+        self.assertEqual(
+            content,
+            [{"type": "input_text", "text": router._OPENAI_ENCRYPTED_PLACEHOLDER}],
         )
 
     def test_openai_sanitize_default_and_override(self):
