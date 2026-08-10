@@ -45,7 +45,7 @@ else:
 CONFIG_PATH = BASE_DIR / "config.json"
 DASHBOARD_PATH = _DATA_DIR / "dashboard.html"
 MODEL_CACHE_TTL = 600  # 上游模型列表缓存秒数
-APP_VERSION = "2026.08.10"
+APP_VERSION = "2026.08.10.1"
 
 app = FastAPI(title="LLM Router", docs_url=None, redoc_url=None)
 
@@ -430,6 +430,7 @@ def _chat_tool_name(name: str, namespace: str | None = None) -> str:
 def _build_tool_bridge(body: dict) -> dict:
     bridge = {"chat_tools": [], "by_chat": {}, "by_response": {}, "unsupported": []}
     used = set()
+    seen = set()
 
     def unique_name(name: str, namespace: str | None) -> str:
         candidate = _chat_tool_name(name, namespace)
@@ -439,6 +440,10 @@ def _build_tool_bridge(body: dict) -> dict:
         raw = f"{namespace or ''}:{name}"
         digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
         candidate = f"{candidate[:55]}_{digest}"
+        counter = 2
+        while candidate in used:
+            candidate = f"{candidate[:55]}_{digest}_{counter}"
+            counter += 1
         used.add(candidate)
         return candidate
 
@@ -462,6 +467,10 @@ def _build_tool_bridge(body: dict) -> dict:
             if kind:
                 bridge["unsupported"].append(str(kind))
             return
+        tool_key = (kind, namespace or "", original_name)
+        if tool_key in seen:
+            return
+        seen.add(tool_key)
         chat_name = unique_name(original_name, namespace)
         description = str(tool.get("description") or "").strip()
         if namespace_description:

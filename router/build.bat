@@ -23,7 +23,7 @@ if errorlevel 1 goto :failed
 echo.
 echo Build completed: dist\LLMRouter.exe
 echo Update package staged: LLMRouter.new.exe
-echo Open the dashboard Settings -> Update, then click Update and restart.
+echo Open the dashboard Settings -^> Update, then click Update and restart.
 exit /b 0
 
 :failed

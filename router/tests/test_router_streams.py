@@ -666,6 +666,41 @@ class RouterRequestConversionTests(unittest.TestCase):
         self.assertEqual(chat["tools"][0]["function"]["name"], "collaboration__spawn_agent")
         self.assertEqual(chat["messages"], [])
 
+    def test_repeated_tool_search_outputs_do_not_duplicate_chat_tool_names(self):
+        namespace = {
+            "type": "namespace",
+            "name": "multi_agent_v1",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "spawn_agent",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                {
+                    "type": "function",
+                    "name": "close_agent",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            ],
+        }
+        body = {
+            "model": "deepseek-v4-flash",
+            "input": [
+                {"type": "tool_search_output", "call_id": "call_1", "tools": [namespace]},
+                {"type": "tool_search_output", "call_id": "call_2", "tools": [namespace]},
+                {"type": "tool_search_output", "call_id": "call_3", "tools": [namespace]},
+            ],
+        }
+
+        bridge = router._build_tool_bridge(body)
+        chat = router.responses_to_chat(body, tool_bridge=bridge)
+        names = [tool["function"]["name"] for tool in chat["tools"]]
+
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(len(chat["tools"]), len(bridge["by_chat"]))
+        self.assertIn("multi_agent_v1__spawn_agent", names)
+        self.assertIn("multi_agent_v1__close_agent", names)
+
     def test_tool_search_gets_codex_query_schema(self):
         chat = router.responses_to_chat({
             "model": "deepseek-v4-flash",
