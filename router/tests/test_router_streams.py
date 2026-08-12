@@ -855,6 +855,19 @@ class RouterRequestConversionTests(unittest.TestCase):
         self.assertEqual(sanitized["input"][0]["content"][0]["text"], "Agent FINAL_ANSWER")
         self.assertEqual(sanitized["input"][1], original["input"][1])
 
+    def test_strip_prompt_cache_key_keeps_original_body_untouched(self):
+        original = {
+            "model": "responses-model",
+            "input": "hello",
+            "prompt_cache_key": "019ff4a7-4a62-7653-87ea-696b0e6f1047",
+        }
+
+        sanitized = router._strip_prompt_cache_key(original)
+
+        self.assertNotIn("prompt_cache_key", sanitized)
+        self.assertEqual(sanitized["input"], "hello")
+        self.assertEqual(original["prompt_cache_key"], "019ff4a7-4a62-7653-87ea-696b0e6f1047")
+
     def test_sanitizer_replaces_encrypted_content_parts_in_standard_messages(self):
         original = {
             "input": [{

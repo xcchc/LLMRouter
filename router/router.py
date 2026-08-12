@@ -322,6 +322,15 @@ def _sanitize_responses_for_non_openai(body: dict) -> dict:
     return sanitized if changed else body
 
 
+def _strip_prompt_cache_key(body: dict) -> dict:
+    """Drop prompt_cache_key before forwarding so third-party gateways do not reject Codex requests."""
+    if not isinstance(body, dict) or "prompt_cache_key" not in body:
+        return body
+    sanitized = copy.deepcopy(body)
+    sanitized.pop("prompt_cache_key", None)
+    return sanitized
+
+
 def _responses_content_to_chat(content):
     """Responses message content -> Chat content；图片保留为 image_url。"""
     if content is None or isinstance(content, str):
@@ -2150,6 +2159,8 @@ async def relay(request: Request, incoming_wire: str):
         out_body = responses_to_chat(body, tool_bridge=tool_bridge)
     else:
         out_body = chat_to_responses(body)
+
+    out_body = _strip_prompt_cache_key(out_body)
 
     try:
         await vision.apply_image_policy(out_body, supplier, cfg, model)
