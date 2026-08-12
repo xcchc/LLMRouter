@@ -102,7 +102,7 @@ cd LLMRouter\router
 - `router\dist\LLMRouter.exe`：可用于发布的新版完整程序。
 - `router\LLMRouter.new.exe`：设置页“更新并重启”可直接识别的更新包。
 
-`LLMRouter.new.exe` 不会进入 Git 仓库，`build.bat` 只在本地生成它，避免直接替换正在运行的旧版。
+`build.bat` 构建完成后会自动生成 `router\LLMRouter.new.exe`，不需要手动改名或提交 Git；把它留在 Router 同目录，设置页就能直接检测到并更新。`LLMRouter.new.exe` 不会进入 Git 仓库，避免直接替换正在运行的旧版。
 
 ### 在设置页更新
 
