@@ -8,6 +8,8 @@
       "api_key": "replace-me",
       "wire_api": "responses",
       "openai_sanitize": true,
+      "responses_compat": "",
+      "forward_prompt_cache_key": false,
       "models": [],
       "price_input_per_1m": 0,
       "price_output_per_1m": 0
@@ -26,11 +28,22 @@
       "vlm_supplier": "responses-provider",
       "vlm_model": "gpt-5.6-luna",
       "vlm_prompt_mode": "main-model"
+    },
+    {
+      "name": "image-provider",
+      "base_url": "https://image-provider.example/v1",
+      "api_key": "replace-me",
+      "wire_api": "responses",
+      "models": [],
+      "price_input_per_1m": 0,
+      "price_output_per_1m": 0,
+      "image_handling": {}
     }
   ],
   "model_map": {
     "gpt-example": "responses-provider",
-    "deepseek-example": "chat-provider"
+    "deepseek-example": "chat-provider",
+    "gpt-image-2": "image-provider"
   },
   "default_supplier": "",
   "model_blacklist": []

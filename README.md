@@ -8,10 +8,13 @@ LLM Router 是一个本地 OpenAI 兼容路由网关。Codex++ 只需要连接�
 
 - 按模型名选择供应商，也可配置默认供应商兜底。
 - 聚合上游模型列表，支持手动补充、隐藏模型和显式模型映射。
-- 同时接收 `/v1/responses` 和 `/v1/chat/completions`。
+- 同时接收 `/v1/responses`、`/v1/chat/completions`、`/v1/images/generations` 和 `/v1/images/edits`。
+- 按 `model_map` 或供应商模型列表，把生图请求转发到配置的图片供应商，技能侧只需连接本地 Router。
 - 在 Responses 与 Chat 协议之间转换文本、推理内容、用量统计、图片输入和 JSON Schema 输出格式。
 - 支持为纯文本模型配置图片省略（`strip`）或视觉模型描述辅助（`vlm`）。
 - 桥接 function、custom、namespace 和 tool search 工具调用。
+- 针对 MiniMax M3 的 Responses 子集提供协议兼容：把 Codex 的 `tool_search` / `custom` / `agent_message` 历史降级为标准 `function` 调用，并只在自己返回内容安全 1026 时单次降级图片。
+- 支持按供应商透传 Codex `prompt_cache_key`，用于能识别该字段的第三方 Responses 上游，避免因 Router 统一剥离导致缓存命中率过低。
 - 在响应开始前对网络错误、429 和临时上游 5xx 做有限重试。
 - 对非原生 OpenAI Responses 上游默认把 Codex 的 `agent_message` 转成普通 user 消息，把 `encrypted_content` 中的任务文本解包为 `input_text`，并移除 `author` / `recipient`、`prompt_cache_key` 等会被第三方网关拒绝的 Codex 字段；无法解包的私有字段会降级为占位文本。
 - 提供本地管理界面，用于维护供应商、模型路由、价格和运行统计。
@@ -72,6 +75,8 @@ Copy-Item config.example.json config.json
 - `suppliers`：上游供应商列表，包含名称、接口地址、API Key、协议和可选模型列表。
 - `wire_api`：上游协议，可选 `responses` 或 `chat`。
 - `openai_sanitize`：是否在转发到非原生 OpenAI Responses 上游前转换 Codex 的 `agent_message` 并解包 `encrypted_content`；缺省为 `true`。
+- `responses_compat`：Responses 上游的专用兼容模式，可选 `""` 或 `"minimax"`；只有 MiniMax M3 供应商需要设置为 `"minimax"`。
+- `forward_prompt_cache_key`：是否把 Codex 的 `prompt_cache_key` 原样透传给上游；仅在上游确实支持缓存键时开启，默认关闭。
 - `model_map`：模型名到供应商名的显式映射。
 - `default_supplier`：没有显式映射时使用的默认供应商。
 - `model_blacklist`：不在合并模型列表中展示的模型。
@@ -86,6 +91,8 @@ Copy-Item config.example.json config.json
 - 协议：Responses
 
 切换模型时，Router 根据 `model_map`、供应商模型列表和 `default_supplier` 选择上游。
+
+生图技能也走同一个入口：在 `suppliers` 中添加图片供应商，并把 `gpt-image-2` 映射到该供应商。技能调用 `http://127.0.0.1:8765/v1/images/generations` 或 `/v1/images/edits`，Router 读取供应商配置并转发，技能不需要知道上游地址或密钥。
 
 ## 更新
 
@@ -124,6 +131,8 @@ cd LLMRouter\router
 - `GET /v1/models`
 - `POST /v1/responses`
 - `POST /v1/chat/completions`
+- `POST /v1/images/generations`
+- `POST /v1/images/edits`
 
 管理 API：
 

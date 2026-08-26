@@ -465,8 +465,10 @@ async function loadSuppliers(){
       const stripCount = imageModes.filter(v => v === 'strip').length;
       const imageSummary = [vlmCount ? `VLM ${vlmCount}` : '', stripCount ? `省略 ${stripCount}` : ''].filter(Boolean).join(' · ') || '全部原样发送';
       const sanitizeText = s.openai_sanitize === false ? '原样透传' : (s.openai_sanitize === true ? '始终清洗' : '自动清洗');
+      const compatText = s.responses_compat === 'minimax' ? '<span class="badge">MiniMax Compat</span>' : '';
+      const cacheForwardText = s.forward_prompt_cache_key ? '<span class="badge">缓存键透传</span>' : '';
       return `<div class="card supplier-card">
-        <div class="head"><span class="name">${esc(s.name)}</span><span class="badge ${s.wire_api === 'chat' ? 'chat' : ''}">${esc(s.wire_api || 'responses')}</span>${cfg.default_supplier === s.name ? '<span class="badge mut">默认</span>' : ''}</div>
+        <div class="head"><span class="name">${esc(s.name)}</span><span class="badge ${s.wire_api === 'chat' ? 'chat' : ''}">${esc(s.wire_api || 'responses')}</span>${compatText}${cacheForwardText}${cfg.default_supplier === s.name ? '<span class="badge mut">默认</span>' : ''}</div>
         <div class="row">地址：<b>${esc(s.base_url)}</b></div>
         <div class="row">Key：<b>${key}</b></div>
         <div class="row">手动模型：<b>${(s.models || []).length} 个</b>（其余自动获取）</div>
@@ -532,6 +534,11 @@ function openSupplierModal(name){
         <option value="true" ${s && s.openai_sanitize === true ? 'selected' : ''}>始终清洗</option>
         <option value="false" ${s && s.openai_sanitize === false ? 'selected' : ''}>原样透传</option>
       </select></div>
+      <div class="field"><label>Responses 兼容模式（仅 Responses 上游生效）</label><select id="fResponsesCompat">
+        <option value="" ${!s || !s.responses_compat ? 'selected' : ''}>无（原样透传）</option>
+        <option value="minimax" ${s && s.responses_compat === 'minimax' ? 'selected' : ''}>MiniMax 协议兼容</option>
+      </select></div>
+      <div class="field"><label><input type="checkbox" id="fForwardPromptCache" ${s && s.forward_prompt_cache_key ? 'checked' : ''}> 透传 prompt_cache_key（仅上游支持时开启，可显著提高缓存命中）</label></div>
       <div class="field"><label>手动模型列表（可选，每行一个；留空则自动从上游获取）</label><textarea id="fModels" placeholder="gpt-5.6-sol&#10;deepseek-v4-flash">${esc((s && s.models || []).join('\n'))}</textarea></div>
       <div class="field"><label>图片处理模式（按模型选择；选择 VLM 后可设置视觉辅助供应商和视觉模型）</label><div id="fImageModeRows"></div></div>
       <div id="fVlmFields" style="display:none">
@@ -637,6 +644,8 @@ function openSupplierModal(name){
         base_url: ($('#fBase').value || '').trim(),
         api_key: ($('#fKey').value || '').trim(),
         wire_api: $('#fWire').value,
+        responses_compat: $('#fResponsesCompat').value,
+        forward_prompt_cache_key: $('#fForwardPromptCache').checked,
         models: ($('#fModels').value || '').split('\n').map(x => x.trim()).filter(Boolean),
         image_handling: currentImageHandling(),
         vlm_supplier: ($('#fVlmSupplier').value || '').trim(),

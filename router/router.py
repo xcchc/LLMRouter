@@ -58,6 +58,14 @@ def _upstream_models_url(base_url: str) -> str:
     return urllib.parse.quote(str(base_url).rstrip("/") + "/models", safe=":/?&=#%+@")
 
 
+def _join_api_path(base_url: str, path: str) -> str:
+    """拼接 OpenAI 兼容路径，兼容 base_url 已带 /v1 或只写域名的情况。"""
+    base = str(base_url or "").rstrip("/")
+    if base.endswith("/v1"):
+        return f"{base}/{path}"
+    return f"{base}/v1/{path}"
+
+
 def _ensure_config() -> None:
     if not CONFIG_PATH.exists():
         default_cfg = {
@@ -329,6 +337,12 @@ def _strip_prompt_cache_key(body: dict) -> dict:
     sanitized = copy.deepcopy(body)
     sanitized.pop("prompt_cache_key", None)
     return sanitized
+
+
+def _should_forward_prompt_cache_key(supplier: dict) -> bool:
+    if not isinstance(supplier, dict):
+        return False
+    return supplier.get("forward_prompt_cache_key") is True
 
 
 def _responses_content_to_chat(content):
@@ -724,6 +738,401 @@ def _custom_input_from_chat_arguments(arguments: str) -> str:
 def _custom_tool_names(body: dict) -> set:
     bridge = _build_tool_bridge(body)
     return {name for name, spec in bridge["by_chat"].items() if spec.get("kind") == "custom"}
+
+
+MINIMAX_SENSITIVE_IMAGE_PLACEHOLDER = "[图片已被 MiniMax 内容安全拒绝]"
+
+
+def _is_minimax_responses_supplier(supplier: dict) -> bool:
+    if not isinstance(supplier, dict):
+        return False
+    return str(supplier.get("responses_compat") or "").strip().lower() == "minimax"
+
+
+def _normalize_minimax_image(part: dict) -> dict:
+    image = part.get("image_url") or part.get("url")
+    detail = part.get("detail") or "auto"
+    if isinstance(image, dict):
+        detail = image.get("detail") or detail
+        image = image.get("url") or image.get("image_url") or ""
+    return {"type": "input_image", "image_url": image or "", "detail": detail}
+
+
+def _normalize_minimax_content(content):
+    """Normalize Responses content parts for MiniMax's smaller InputItem schema."""
+    if isinstance(content, str):
+        return content if content else None
+    if not isinstance(content, list):
+        text = str(content)
+        return text if text.strip() else None
+    parts = []
+    for part in content:
+        if isinstance(part, str):
+            if part:
+                parts.append({"type": "input_text", "text": part})
+            continue
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type == "encrypted_content":
+            payload = part.get("encrypted_content")
+            text = payload if isinstance(payload, str) and payload else _OPENAI_ENCRYPTED_PLACEHOLDER
+            parts.append({"type": "input_text", "text": text})
+        elif part_type in ("input_image", "image_url"):
+            parts.append(_normalize_minimax_image(part))
+        elif part_type == "input_file":
+            label = part.get("filename") or part.get("file_id") or "附件"
+            parts.append({"type": "input_text", "text": f"[文件: {label}]"})
+        elif part_type in ("input_text", "output_text", "text"):
+            text = part.get("text")
+            if text is not None:
+                parts.append({"type": "input_text", "text": str(text)})
+        else:
+            text = _content_to_text([part]) or json.dumps(part, ensure_ascii=False)
+            if text:
+                parts.append({"type": "input_text", "text": text})
+    return parts if parts else None
+
+
+def _minimax_output_is_content_parts(output) -> bool:
+    if not isinstance(output, list):
+        return False
+    content_types = {
+        "input_text",
+        "output_text",
+        "text",
+        "input_image",
+        "image_url",
+        "input_file",
+        "refusal",
+    }
+    for part in output:
+        if isinstance(part, str):
+            continue
+        if not isinstance(part, dict) or part.get("type") not in content_types:
+            return False
+    return True
+
+
+def _minimax_output_value(output):
+    if isinstance(output, str):
+        return output
+    if _minimax_output_is_content_parts(output):
+        return _normalize_minimax_content(output) or []
+    if output is None:
+        return ""
+    return json.dumps(output, ensure_ascii=False)
+
+
+def _minimax_tool_search_text(item: dict) -> str:
+    output = item.get("output")
+    if _minimax_output_is_content_parts(output):
+        return _minimax_output_value(output)
+    loaded = []
+    candidates = item.get("tools") or output or []
+    if isinstance(candidates, dict):
+        candidates = candidates.get("tools") or [candidates]
+    if isinstance(candidates, list):
+        for tool in candidates:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") == "namespace":
+                namespace = tool.get("name") or "namespace"
+                loaded.extend(
+                    f"{namespace}__{x.get('name')}"
+                    for x in tool.get("tools") or []
+                    if isinstance(x, dict) and x.get("name")
+                )
+            elif tool.get("name"):
+                loaded.append(str(tool["name"]))
+    if loaded:
+        return "Loaded tools: " + ", ".join(loaded)
+    payload = output if output is not None else item.get("tools")
+    return _minimax_output_value(payload)
+
+
+def _minimax_unknown_item_text(item: dict) -> str:
+    for key in ("content", "output", "input", "arguments"):
+        payload = item.get(key)
+        if payload is None:
+            continue
+        if isinstance(payload, str):
+            if payload.strip():
+                return payload
+            continue
+        if isinstance(payload, list):
+            text = _content_to_text(payload)
+            if text:
+                return text
+        if isinstance(payload, (dict, list)):
+            return json.dumps(payload, ensure_ascii=False)
+        if str(payload).strip():
+            return str(payload)
+    return ""
+
+
+def _minimax_user_message(text: str) -> dict:
+    return {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}
+
+
+def _minimax_message_item(item: dict) -> dict | None:
+    role = item.get("role") or "user"
+    if role == "developer":
+        role = "system"
+    if role not in ("user", "system", "assistant"):
+        role = "user"
+    content = _normalize_minimax_content(_unwrap_encrypted_content_parts(item.get("content")))
+    if not content:
+        return None
+    return {"type": "message", "role": role, "content": content}
+
+
+def _minimax_agent_item(item: dict) -> dict:
+    content = _normalize_minimax_content(_unwrap_encrypted_content_parts(item.get("content")))
+    if not content:
+        return _minimax_user_message("Agent message content is unavailable.")
+    return {"type": "message", "role": "user", "content": content}
+
+
+def _minimax_call_id(item: dict) -> str:
+    return item.get("call_id") or item.get("id") or ("call_" + uuid.uuid4().hex[:16])
+
+
+def _minimax_call_item(item: dict, bridge: dict) -> dict:
+    item_type = item.get("type")
+    call_id = _minimax_call_id(item)
+    if item_type == "function_call":
+        return {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": str(item.get("name") or ""),
+            "arguments": _args_to_string(item.get("arguments", {})),
+        }
+    if item_type == "tool_search_call":
+        name = str(item.get("name") or "tool_search")
+        arguments = item.get("arguments") if "arguments" in item else item.get("action") or {}
+        if not isinstance(arguments, str):
+            arguments = _args_to_string(arguments or {})
+        return {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": _bridge_chat_name(bridge, "tool_search", name, item.get("namespace")),
+            "arguments": arguments,
+        }
+    name = str(item.get("name") or "custom_tool")
+    return {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": _bridge_chat_name(bridge, "custom", name, item.get("namespace")),
+        "arguments": _custom_tool_arguments(item.get("input", item.get("arguments", {}))),
+    }
+
+
+def _minimax_tools_from_bridge(bridge: dict) -> list:
+    tools = []
+    for tool in bridge.get("chat_tools") or []:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        fn = tool.get("function") or {}
+        name = fn.get("name") or tool.get("name") or ""
+        if not name:
+            continue
+        item = {"type": "function", "name": str(name)}
+        if fn.get("description") is not None:
+            item["description"] = str(fn["description"])
+        if isinstance(fn.get("parameters"), dict):
+            item["parameters"] = fn["parameters"]
+        tools.append(item)
+    return tools
+
+
+def _minimax_tool_choice(tool_choice, bridge: dict):
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+    kind = tool_choice.get("type")
+    if kind == "namespace":
+        nested = tool_choice.get("tools") or []
+        if nested and isinstance(nested[0], dict):
+            inner = dict(nested[0])
+            inner.setdefault("namespace", tool_choice.get("name"))
+            return _minimax_tool_choice(inner, bridge)
+        return tool_choice
+    if kind not in ("function", "custom", "tool_search"):
+        return tool_choice
+    name = tool_choice.get("name")
+    if not name:
+        fn = tool_choice.get("function") or {}
+        name = fn.get("name") or ("tool_search" if kind == "tool_search" else "")
+    fn_name = _bridge_chat_name(bridge, kind, str(name), tool_choice.get("namespace"))
+    return {"type": "function", "name": fn_name}
+
+
+def _sanitize_responses_for_minimax(body: dict) -> dict:
+    """Adapt Codex Responses bodies to MiniMax's supported Responses subset."""
+    if not isinstance(body, dict):
+        return body
+
+    sanitized = copy.deepcopy(body)
+    bridge = _build_tool_bridge(sanitized)
+    changed = False
+
+    if sanitized.get("tools") is not None or bridge.get("chat_tools"):
+        sanitized["tools"] = _minimax_tools_from_bridge(bridge)
+        changed = True
+
+    if sanitized.get("tool_choice") is not None:
+        sanitized["tool_choice"] = _minimax_tool_choice(sanitized["tool_choice"], bridge)
+        changed = True
+
+    input_value = sanitized.get("input")
+    if isinstance(input_value, str):
+        return sanitized
+    if not isinstance(input_value, list):
+        sanitized["input"] = []
+        changed = True
+        return sanitized
+
+    known_call_ids = set()
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in ("function_call", "tool_search_call", "custom_tool_call"):
+            call_id = item.get("call_id") or item.get("id") or ""
+            if call_id:
+                known_call_ids.add(call_id)
+
+    new_input = []
+    for item in input_value:
+        if isinstance(item, str):
+            if item.strip():
+                new_input.append(_minimax_user_message(item))
+                changed = True
+            continue
+        if not isinstance(item, dict):
+            changed = True
+            continue
+
+        item_type = item.get("type")
+        if item_type in ("function_call", "tool_search_call", "custom_tool_call"):
+            new_input.append(_minimax_call_item(item, bridge))
+            changed = True
+        elif item_type in ("message", "reasoning"):
+            if item_type == "message":
+                message = _minimax_message_item(item)
+                if message is not None:
+                    new_input.append(message)
+                    changed = True
+            else:
+                reasoning = dict(item)
+                reasoning.pop("author", None)
+                reasoning.pop("recipient", None)
+                new_input.append(reasoning)
+                changed = True
+        elif item_type == "agent_message":
+            new_input.append(_minimax_agent_item(item))
+            changed = True
+        elif item_type == "function_call_output":
+            call_id = item.get("call_id") or item.get("id") or ""
+            if call_id:
+                new_input.append({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": _minimax_output_value(item.get("output")),
+                })
+            else:
+                text = _minimax_unknown_item_text(item)
+                if text:
+                    new_input.append(_minimax_user_message(text))
+            changed = True
+        elif item_type == "tool_search_output":
+            call_id = item.get("call_id") or item.get("id") or ""
+            if call_id in known_call_ids:
+                new_input.append({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": _minimax_tool_search_text(item),
+                })
+            else:
+                text = _minimax_tool_search_text(item)
+                if text:
+                    new_input.append(_minimax_user_message(text))
+            changed = True
+        elif item_type == "custom_tool_call_output":
+            call_id = item.get("call_id") or item.get("id") or ""
+            if call_id in known_call_ids:
+                new_input.append({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": _minimax_output_value(item.get("output")),
+                })
+            else:
+                text = _minimax_unknown_item_text(item)
+                if text:
+                    new_input.append(_minimax_user_message(text))
+            changed = True
+        else:
+            text = _minimax_unknown_item_text(item)
+            if text:
+                new_input.append(_minimax_user_message(text))
+            changed = True
+
+    sanitized["input"] = new_input
+    sanitized.pop("prompt_cache_key", None)
+    return sanitized if changed else sanitized
+
+
+def _minimax_sensitive_image_error(error_text: str) -> bool:
+    if not error_text:
+        return False
+    text = error_text.lower()
+    return (
+        "new_sensitive" in text
+        or "image is sensitive" in text
+        or "(1026)" in text
+        or re.search(r"messages\[\d+\].*\bcontent\[\d+\]", text) is not None
+    )
+
+
+def _minimax_image_candidates(body: dict) -> list:
+    candidates = []
+
+    def visit(value, path):
+        if isinstance(value, dict):
+            if value.get("type") in ("input_image", "image_url"):
+                candidates.append((path, value))
+            for key, child in value.items():
+                visit(child, path + (key,))
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, path + (index,))
+
+    visit(body, ())
+    return candidates
+
+
+def _replace_at_path(value, path, replacement):
+    if not path:
+        return replacement
+    key = path[0]
+    if isinstance(value, list):
+        value[key] = _replace_at_path(value[key], path[1:], replacement)
+    elif isinstance(value, dict):
+        value[key] = _replace_at_path(value[key], path[1:], replacement)
+    return value
+
+
+def _strip_sensitive_image_candidate(body: dict) -> dict | None:
+    candidates = _minimax_image_candidates(body)
+    if not candidates:
+        return None
+    sanitized = copy.deepcopy(body)
+    path, _part = candidates[-1]
+    _replace_at_path(
+        sanitized,
+        path,
+        {"type": "input_text", "text": MINIMAX_SENSITIVE_IMAGE_PLACEHOLDER},
+    )
+    return sanitized
 
 
 def responses_to_chat(body: dict, tool_bridge=None) -> dict:
@@ -2148,19 +2557,27 @@ async def relay(request: Request, incoming_wire: str):
         upstream_wire = "responses"
     path = "responses" if upstream_wire == "responses" else "chat/completions"
     base = str(supplier.get("base_url", "")).rstrip("/")
-    url = f"{base}/{path}"
+    url = _join_api_path(base, path)
     tool_bridge = _build_tool_bridge(body) if incoming_wire == "responses" and upstream_wire == "chat" else None
+    is_minimax_responses = (
+        incoming_wire == "responses"
+        and upstream_wire == "responses"
+        and _is_minimax_responses_supplier(supplier)
+    )
 
     if incoming_wire == upstream_wire:
         out_body = body
-        if incoming_wire == "responses" and _should_sanitize_openai_fields(supplier):
+        if is_minimax_responses:
+            out_body = _sanitize_responses_for_minimax(out_body)
+        elif incoming_wire == "responses" and _should_sanitize_openai_fields(supplier):
             out_body = _sanitize_responses_for_non_openai(out_body)
     elif incoming_wire == "responses":
         out_body = responses_to_chat(body, tool_bridge=tool_bridge)
     else:
         out_body = chat_to_responses(body)
 
-    out_body = _strip_prompt_cache_key(out_body)
+    if not _should_forward_prompt_cache_key(supplier):
+        out_body = _strip_prompt_cache_key(out_body)
 
     try:
         await vision.apply_image_policy(out_body, supplier, cfg, model)
@@ -2197,6 +2614,7 @@ async def relay(request: Request, incoming_wire: str):
     response_error_text = None
     transport_retries = 0
     applied_compat_fallbacks = frozenset()
+    minimax_image_retried = False
     request_body = out_body
     while True:
         try:
@@ -2222,8 +2640,24 @@ async def relay(request: Request, incoming_wire: str):
             continue
 
         response_error_text = None
-        if resp.status_code == 400 and upstream_wire == "chat":
+        if (
+            is_minimax_responses
+            and not minimax_image_retried
+            and resp.status_code in (400, 422)
+        ):
             response_error_text = (await resp.aread()).decode("utf-8", "replace")
+            if _minimax_sensitive_image_error(response_error_text):
+                next_body = _strip_sensitive_image_candidate(request_body)
+                if next_body is not None:
+                    await resp.aclose()
+                    resp = None
+                    request_body = next_body
+                    minimax_image_retried = True
+                    rec["retry_count"] += 1
+                    continue
+        if resp.status_code == 400 and upstream_wire == "chat":
+            if response_error_text is None:
+                response_error_text = (await resp.aread()).decode("utf-8", "replace")
             next_body, fallback = _next_chat_compat_fallback(
                 request_body,
                 resp.status_code,
@@ -2345,6 +2779,111 @@ async def relay(request: Request, incoming_wire: str):
     return StreamingResponse(gen(), status_code=resp.status_code, media_type="text/event-stream")
 
 
+def _image_request_headers(supplier: dict, request: Request, content_type: str) -> dict:
+    headers = {
+        "Authorization": f"Bearer {supplier.get('api_key', '')}",
+        "Accept": "application/json",
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    beta = request.headers.get("openai-beta")
+    if beta:
+        headers["OpenAI-Beta"] = beta
+    return headers
+
+
+def _multipart_model(raw: bytes) -> str:
+    match = re.search(rb'name\s*=\s*"model"\r?\n\r?\n([^\r\n]+)', raw)
+    if not match:
+        return ""
+    return match.group(1).decode("utf-8", "replace").strip()
+
+
+async def _relay_image(request: Request, path: str) -> Response:
+    """把 /v1/images/* 请求按 model 转发到已配置的图片供应商。"""
+    cfg = load_config()
+    content_type = request.headers.get("content-type", "")
+    raw_body = None
+    body = None
+    if "multipart/form-data" in content_type.lower():
+        raw_body = await request.body()
+        model = _multipart_model(raw_body)
+    else:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        model = (body or {}).get("model", "")
+
+    supplier = await find_supplier(cfg, model)
+    if not supplier:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"message": f"模型 {model} 没有可用的上游：请在控制台中添加供应商或配置 model_map。"}},
+        )
+
+    base = str(supplier.get("base_url", "")).rstrip("/")
+    url = _join_api_path(base, path)
+    headers = _image_request_headers(supplier, request, content_type)
+    rec = {
+        "ts": time.time(),
+        "model": model,
+        "supplier": supplier.get("name", ""),
+        "upstream_wire": "image",
+        "incoming_wire": "image",
+        "http_status": None,
+        "status": "ok",
+        "input_tokens": None,
+        "cached_tokens": None,
+        "output_tokens": None,
+        "reasoning_tokens": None,
+        "total_tokens": None,
+        "duration_ms": None,
+        "reasoning_effort": None,
+        "error": None,
+        "retry_count": 0,
+    }
+    start_mono = time.monotonic()
+    client = None
+    resp = None
+    response_body = b""
+    try:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(None))
+        if raw_body is not None:
+            req = client.build_request("POST", url, content=raw_body, headers=headers)
+        else:
+            req = client.build_request("POST", url, json=body, headers=headers)
+        resp = await client.send(req)
+        response_body = await resp.aread()
+    except Exception as exc:
+        rec["status"] = "error"
+        rec["http_status"] = 0
+        rec["error"] = str(exc)[:300]
+        rec["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
+        stats.record(rec)
+        return JSONResponse(
+            status_code=502,
+            content={"error": {"message": f"连接上游 {base} 失败：{exc}"}},
+        )
+    finally:
+        if resp is not None:
+            await resp.aclose()
+        if client is not None:
+            await client.aclose()
+
+    rec["http_status"] = resp.status_code
+    rec["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
+    if resp.status_code >= 400:
+        rec["status"] = "error"
+        rec["error"] = response_body[:300].decode("utf-8", "replace")
+    stats.record(rec)
+    return Response(
+        content=response_body,
+        status_code=resp.status_code,
+        headers={"content-type": resp.headers.get("content-type") or "application/json"},
+    )
+
+
 # ------------------ 控制台 API ------------------
 
 @app.get("/")
@@ -2375,6 +2914,15 @@ def validate_supplier(s: dict) -> str | None:
         return f"供应商 {s.get('name')} 的 vlm_prompt_mode 只能是 main-model 或 template"
     if s.get("openai_sanitize") is not None and not isinstance(s.get("openai_sanitize"), bool):
         return f"供应商 {s.get('name')} 的 openai_sanitize 必须是布尔值"
+    responses_compat = s.get("responses_compat")
+    if responses_compat is not None and (
+        not isinstance(responses_compat, str)
+        or responses_compat.strip().lower() not in ("", "minimax")
+    ):
+        return f"供应商 {s.get('name')} 的 responses_compat 只能是空值或 minimax"
+    forward_cache_key = s.get("forward_prompt_cache_key")
+    if forward_cache_key is not None and not isinstance(forward_cache_key, bool):
+        return f"供应商 {s.get('name')} 的 forward_prompt_cache_key 必须是布尔值"
     image_handling = s.get("image_handling")
     if image_handling is not None:
         if isinstance(image_handling, str):
@@ -2980,6 +3528,16 @@ async def post_responses(request: Request):
 @app.post("/v1/chat/completions")
 async def post_chat(request: Request):
     return await relay(request, "chat")
+
+
+@app.post("/v1/images/generations")
+async def post_images_generations(request: Request):
+    return await _relay_image(request, "images/generations")
+
+
+@app.post("/v1/images/edits")
+async def post_images_edits(request: Request):
+    return await _relay_image(request, "images/edits")
 
 
 if __name__ == "__main__":

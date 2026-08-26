@@ -8,7 +8,7 @@ LLM Router 是一个本地 OpenAI 兼容路由网关。Codex++ 只需要连接�
 
 - 按模型名选择供应商，也可配置默认供应商兜底。
 - 聚合上游模型列表，并支持手动补充或隐藏模型。
-- 同时接收 `/v1/responses` 和 `/v1/chat/completions` 请求。
+- 同时接收 `/v1/responses`、`/v1/chat/completions`、`/v1/images/generations` 和 `/v1/images/edits` 请求。
 - 在 Responses 与 Chat 协议之间转换文本、推理内容、用量统计、图片输入和 JSON Schema 输出格式。
 - 支持为纯文本模型配置图片省略（strip）或视觉模型描述辅助（VLM）。
 - 桥接 function、custom、namespace 和 tool search 工具调用，并尽量还原 Codex 的过程折叠、文件修改卡和 diff 展示。
@@ -27,6 +27,8 @@ Router 的目标是让 DeepSeek 和其他 Chat 协议模型在 Codex 中尽可�
 - `web_search` 等由 OpenAI 服务端执行的托管工具，需要额外接入真实的搜索或工具后端。Router 只会向上游说明能力限制，不会伪造成功结果。
 - 某些 Chat 上游不接受强制 `tool_choice`，或会返回非标准工具调用字段。这类差异需要由具体供应商适配。
 - 图片会映射为 Chat `image_url`。Router 支持按模型配置三种处理模式：`send-as-is` 原样发送、`strip` 替换为文本占位、`vlm` 先交给视觉辅助供应商生成描述再注入请求。仅接受文本的模型应使用 `strip` 或 `vlm`。
+- MiniMax M3 的 Responses 子集只接受 `message` / `function_call` / `function_call_output` / `reasoning` 和标准 `function` 工具。使用 MiniMax 时应在供应商配置 `"responses_compat": "minimax"`，Router 会把 Codex 历史里的 `tool_search_call`、`tool_search_output`、`custom_tool_call`、`custom_tool_call_output`、`agent_message` 降级为标准 Responses；M3 仍默认发送图片，只有收到 `1026 image is sensitive` 内容安全错误时才单次替换问题图片后重试。
+- 部分第三方 Responses 上游需要 Codex 的 `prompt_cache_key` 才能复用 prompt 缓存。若该上游本身支持，可在供应商配置 `"forward_prompt_cache_key": true`，Router 不再剥离这个字段；默认仍保持剥离，避免影响不支持的网关。
 - Responses 的内嵌文件和音频没有通用的 Chat 等价格式，目前不能保证保真转换。Codex 读取本地文件时应优先使用客户端文件工具。
 - Chat 流没有原生 `phase`。Router 需要等到文本结束或出现工具调用后，才能可靠区分 commentary 与 final answer，因此首段文本的显示时机无法做到与原生 Responses 完全一致。
 - 上游在流式响应开始后中断时，Router 不能透明重试整次生成，否则可能产生重复文本或重复工具调用。
@@ -66,6 +68,8 @@ Copy-Item config.example.json config.json
 - `suppliers`：供应商列表，包含名称、接口地址、API Key、上游协议和可选模型列表。
 - `wire_api`：上游协议，可选 `responses` 或 `chat`。
 - `openai_sanitize`：是否在转发到非原生 OpenAI Responses 上游前清理 Codex 的 `agent_message` / `encrypted_content`；缺省为 `true`，仅对 Responses 上游生效。
+- `responses_compat`：Responses 上游的专用兼容模式，可选 `""` 或 `minimax`；仅 MiniMax M3 供应商设置为 `minimax`。
+- `forward_prompt_cache_key`：是否透传 `prompt_cache_key`；仅上游明确支持时开启，默认 `false`。
 - `image_handling`：供应商内按模型名配置图片处理模式，取值为 `send-as-is`、`strip` 或 `vlm`；缺省为 `send-as-is`。
 - `vlm_supplier`：`vlm` 模式使用的视觉辅助供应商名称，复用其 `base_url` 和 `api_key`。
 - `vlm_model`：视觉辅助供应商使用的视觉模型名，例如 `gpt-5.6-luna`。
@@ -84,6 +88,16 @@ Copy-Item config.example.json config.json
 - 协议：Responses
 
 Codex++ 始终连接这个本地供应商。切换模型时，Router 根据 `model_map`、供应商模型列表和 `default_supplier` 选择上游。
+
+## 图片生成代理
+
+`new-imagegen` 这类生图 Skill 不需要直接读取上游供应商地址。只需：
+
+- 在 Router 供应商列表中添加图片供应商，填写它的 `base_url`、`api_key` 和 `models`。
+- 在 `model_map` 中把生图模型映射到该供应商，例如 `"gpt-image-2": "pixel-ds-img"`。
+- 让 Skill 调用 `http://127.0.0.1:8765`，Router 会按模型名转发到供应商的 `/v1/images/generations` 或 `/v1/images/edits`。
+
+Router 不会把供应商的 `api_key` 返回给 Skill，也不会要求 Skill 知道供应商的真实地址。
 
 ## 图片处理模式
 

@@ -249,5 +249,105 @@ class NonStreamRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(StaticJsonClient.closed)
 
 
+class PromptCacheKeyForwardTests(unittest.IsolatedAsyncioTestCase):
+    async def _relay(self, supplier, request_body):
+        StaticJsonClient.raw_body = (
+            b'{"object":"response","status":"completed",'
+            b'"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}'
+        )
+        StaticJsonClient.content_type = "application/json"
+        StaticJsonClient.requests = []
+        records = []
+
+        async def find_supplier(_cfg, _model):
+            return supplier
+
+        with (
+            patch.object(router, "load_config", return_value={}),
+            patch.object(router, "find_supplier", new=find_supplier),
+            patch.object(router.httpx, "AsyncClient", StaticJsonClient),
+            patch.object(router.stats, "record", side_effect=records.append),
+        ):
+            response = await router.relay(FakeRequest(request_body), "responses")
+        return response, records
+
+    async def test_relay_forwards_prompt_cache_key_when_explicitly_enabled(self):
+        supplier = {
+            "name": "pixel",
+            "base_url": "https://provider.example/v1",
+            "api_key": "test-key",
+            "wire_api": "responses",
+            "forward_prompt_cache_key": True,
+        }
+        body = {
+            "model": "gpt-5.6-sol",
+            "stream": False,
+            "prompt_cache_key": "019ff4a7-4a62-7653-87ea-696b0e6f1047",
+            "input": [{
+                "type": "agent_message",
+                "author": "subagent",
+                "content": [
+                    {"type": "input_text", "text": "Task:"},
+                    {"type": "encrypted_content", "encrypted_content": "PAYLOAD-1234"},
+                ],
+            }],
+        }
+
+        response, _records = await self._relay(supplier, body)
+
+        self.assertEqual(response.status_code, 200)
+        sent = json.loads(StaticJsonClient.requests[0].content)
+        self.assertEqual(sent["prompt_cache_key"], "019ff4a7-4a62-7653-87ea-696b0e6f1047")
+        self.assertEqual(sent["input"][0]["type"], "message")
+
+    async def test_relay_strips_prompt_cache_key_when_not_opt_in(self):
+        supplier = {
+            "name": "responses-provider",
+            "base_url": "https://provider.example/v1",
+            "api_key": "test-key",
+            "wire_api": "responses",
+            "openai_sanitize": False,
+        }
+        body = {
+            "model": "same-model",
+            "stream": False,
+            "input": "hello",
+            "prompt_cache_key": "019ff4a7-4a62-7653-87ea-696b0e6f1047",
+        }
+
+        response, _records = await self._relay(supplier, body)
+
+        self.assertEqual(response.status_code, 200)
+        sent = json.loads(StaticJsonClient.requests[0].content)
+        self.assertNotIn("prompt_cache_key", sent)
+
+    def test_should_forward_prompt_cache_key_only_for_explicit_true(self):
+        self.assertTrue(router._should_forward_prompt_cache_key(
+            {"forward_prompt_cache_key": True}
+        ))
+        self.assertFalse(router._should_forward_prompt_cache_key(
+            {"forward_prompt_cache_key": False}
+        ))
+        self.assertFalse(router._should_forward_prompt_cache_key({}))
+        self.assertFalse(router._should_forward_prompt_cache_key(None))
+
+    def test_validate_supplier_requires_boolean_forward_prompt_cache_key(self):
+        base = {
+            "name": "pixel",
+            "base_url": "https://provider.example/v1",
+            "api_key": "test-key",
+            "wire_api": "responses",
+        }
+        self.assertIsNone(router.validate_supplier(
+            {**base, "forward_prompt_cache_key": True}
+        ))
+        self.assertIsNone(router.validate_supplier(
+            {**base, "forward_prompt_cache_key": False}
+        ))
+        self.assertIsNotNone(router.validate_supplier(
+            {**base, "forward_prompt_cache_key": "true"}
+        ))
+
+
 if __name__ == "__main__":
     unittest.main()
