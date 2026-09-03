@@ -89,6 +89,40 @@ class NonStreamRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(json.loads(StaticJsonClient.requests[0].content)["stream"])
         self.assertEqual(records[0]["total_tokens"], 5)
 
+    async def test_chat_usage_cache_aliases_are_recorded(self):
+        upstream = {
+            "id": "chatcmpl_cached",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "z-ai/glm-5.3-flash",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "OK"},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 8,
+                "total_tokens": 108,
+                "cache_read_input_tokens": 64,
+            },
+        }
+
+        response, records = await self._relay(
+            "responses",
+            "chat",
+            {"model": "z-ai/glm-5.3-flash", "input": "hello", "stream": False},
+            json.dumps(upstream).encode("utf-8"),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(records[0]["input_tokens"], 100)
+        # The router accepts cache-read aliases even when the provider does
+        # not use OpenAI's nested prompt_tokens_details shape.
+        self.assertEqual(records[0]["cached_tokens"], 64)
+        self.assertEqual(records[0]["output_tokens"], 8)
+        self.assertEqual(records[0]["total_tokens"], 108)
+
     async def test_same_wire_responses_unwraps_agent_message_for_third_party(self):
         raw_body = b'{"object":"response","status":"completed"}'
         request_body = {

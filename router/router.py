@@ -45,7 +45,7 @@ else:
 CONFIG_PATH = BASE_DIR / "config.json"
 DASHBOARD_PATH = _DATA_DIR / "dashboard.html"
 MODEL_CACHE_TTL = 600  # 上游模型列表缓存秒数
-APP_VERSION = "2026.08.10.1"
+APP_VERSION = "2026.09.03.2"
 
 app = FastAPI(title="LLM Router", docs_url=None, redoc_url=None)
 
@@ -343,6 +343,20 @@ def _should_forward_prompt_cache_key(supplier: dict) -> bool:
     if not isinstance(supplier, dict):
         return False
     return supplier.get("forward_prompt_cache_key") is True
+
+
+def _ensure_chat_stream_usage(body: dict) -> dict:
+    """Request the standalone usage frame for streamed Chat upstreams."""
+    if not isinstance(body, dict) or body.get("stream") is not True:
+        return body
+    stream_options = body.get("stream_options")
+    if isinstance(stream_options, dict) and "include_usage" in stream_options:
+        return body
+    out = copy.deepcopy(body)
+    merged_options = dict(stream_options) if isinstance(stream_options, dict) else {}
+    merged_options["include_usage"] = True
+    out["stream_options"] = merged_options
+    return out
 
 
 def _responses_content_to_chat(content):
@@ -1312,6 +1326,17 @@ def responses_to_chat(body: dict, tool_bridge=None) -> dict:
         chat["parallel_tool_calls"] = body["parallel_tool_calls"]
     if response_format:
         chat["response_format"] = response_format
+    # xKiro (and OpenAI-compatible Chat providers) emit token usage for a
+    # streamed request only when this opt-in is present.  The usage frame is a
+    # separate chunk with an empty choices array, so preserve an explicit
+    # caller setting but enable it by default for the router's accounting.
+    stream_options = body.get("stream_options")
+    if isinstance(stream_options, dict):
+        chat["stream_options"] = copy.deepcopy(stream_options)
+        if body.get("stream") is True and "include_usage" not in chat["stream_options"]:
+            chat["stream_options"]["include_usage"] = True
+    elif body.get("stream") is True:
+        chat["stream_options"] = {"include_usage": True}
     return chat
 
 
@@ -1959,7 +1984,7 @@ class ChatToResponses:
             return None
         return {
             "input_tokens": u.get("prompt_tokens", 0),
-            "input_tokens_details": {"cached_tokens": (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)},
+            "input_tokens_details": {"cached_tokens": _usage_cached_tokens(u)},
             "output_tokens": u.get("completion_tokens", 0),
             "output_tokens_details": {"reasoning_tokens": (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)},
             "total_tokens": u.get("total_tokens", 0),
@@ -2000,6 +2025,7 @@ class ResponsesToChat:
         self.role_sent = False
         self.usage = None
         self.status = "completed"
+        self._reasoning_parts = {}
 
     @staticmethod
     def _chunk(delta: dict, finish_reason=None) -> dict:
@@ -2098,6 +2124,23 @@ class ResponsesToChat:
         if rec is not None:
             self._emit_item_arguments(rec, item, events, final=final)
 
+    def _emit_reasoning_summary(self, summary, events: list, item_id="") -> None:
+        """Emit only reasoning text not already sent by summary deltas."""
+        text = _extract_reasoning_text(summary)
+        if not text:
+            return
+        key = str(item_id or "__default__")
+        emitted = self._reasoning_parts.get(key, "")
+        if text == emitted:
+            return
+        if emitted and text.startswith(emitted):
+            text = text[len(emitted):]
+        if not text:
+            return
+        self._ensure_role(events)
+        events.append(self._chunk({"reasoning_content": text, "reasoning": text}))
+        self._reasoning_parts[key] = emitted + text
+
     def on_event(self, evt: dict) -> list:
         events = []
         t = evt.get("type")
@@ -2108,12 +2151,22 @@ class ResponsesToChat:
             else:
                 self._handle_tool_item(item, events)
         elif t == "response.output_item.done":
-            self._handle_tool_item(evt.get("item") or {}, events, final=True)
+            item = evt.get("item") or {}
+            if item.get("type") == "reasoning":
+                self._emit_reasoning_summary(
+                    item.get("summary") or item.get("content") or item.get("text"),
+                    events,
+                    item.get("id"),
+                )
+            else:
+                self._handle_tool_item(item, events, final=True)
         elif t in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
             d = evt.get("delta", "")
             if d:
                 self._ensure_role(events)
                 events.append(self._chunk({"reasoning_content": d, "reasoning": d}))
+                key = str(evt.get("item_id") or "__default__")
+                self._reasoning_parts[key] = self._reasoning_parts.get(key, "") + d
         elif t == "response.output_text.delta":
             d = evt.get("delta", "")
             if d:
@@ -2151,7 +2204,14 @@ class ResponsesToChat:
             self.usage = resp_obj.get("usage")
             for item in resp_obj.get("output") or []:
                 if isinstance(item, dict):
-                    self._handle_tool_item(item, events, final=True)
+                    if item.get("type") == "reasoning":
+                        self._emit_reasoning_summary(
+                            item.get("summary") or item.get("content") or item.get("text"),
+                            events,
+                            item.get("id"),
+                        )
+                    else:
+                        self._handle_tool_item(item, events, final=True)
         elif t == "response.failed":
             self.status = "failed"
         return events
@@ -2226,7 +2286,7 @@ class ResponsesToChat:
     def _map_usage(u) -> dict:
         return {
             "prompt_tokens": u.get("input_tokens", 0),
-            "prompt_tokens_details": {"cached_tokens": (u.get("input_tokens_details") or {}).get("cached_tokens", 0)},
+            "prompt_tokens_details": {"cached_tokens": _usage_cached_tokens(u)},
             "completion_tokens": u.get("output_tokens", 0),
             "completion_tokens_details": {"reasoning_tokens": (u.get("output_tokens_details") or {}).get("reasoning_tokens", 0)},
             "total_tokens": u.get("total_tokens", 0),
@@ -2255,6 +2315,28 @@ def upstream_headers(supplier: dict, request: Request) -> dict:
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
     }
+    if supplier.get("forward_client_identity"):
+        incoming_ua = request.headers.get("user-agent")
+        if incoming_ua:
+            headers["User-Agent"] = incoming_ua
+        for key, value in request.headers.items():
+            lower = key.lower()
+            # This header identifies the local Codex Switch proxy. It is not
+            # the client's identity and must not be exposed to an upstream.
+            if lower == "x-openai-actor-authorization":
+                continue
+            if (
+                lower.startswith("openai")
+                or lower.startswith("codex")
+                or lower.startswith("x-codex")
+                or lower.startswith("x-openai")
+                or lower.startswith("x-oai")
+                or lower.startswith("x-client-request-id")
+                or lower.startswith("x-responsesapi")
+                or lower.startswith("x-reasoning-included")
+                or lower.startswith("x-models-etag")
+            ):
+                headers[key] = value
     beta = request.headers.get("openai-beta")
     if beta:
         headers["OpenAI-Beta"] = beta
@@ -2429,6 +2511,14 @@ def _chat_json_to_responses_json(payload: dict, model: str, tool_bridge=None) ->
     return response
 
 
+def _raw_chat_usage(payload: dict):
+    """Return the original Chat usage object for provider-specific accounting."""
+    if not isinstance(payload, dict):
+        return None
+    usage = payload.get("usage")
+    return usage if isinstance(usage, dict) else None
+
+
 def _responses_json_to_chat_json(payload: dict, model: str) -> dict:
     """Convert one complete Responses object into a Chat Completions response."""
     if not isinstance(payload, dict):
@@ -2520,23 +2610,152 @@ def _responses_json_to_chat_json(payload: dict, model: str) -> dict:
     return result
 
 
+def _usage_number(value):
+    """Return a non-negative integer token count, or None when absent."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0, number)
+
+
+def _first_usage_number(*values):
+    for value in values:
+        number = _usage_number(value)
+        if number is not None:
+            return number
+    return 0
+
+
+def _usage_detail_number(usage: dict, detail_key: str, *field_names):
+    detail = usage.get(detail_key)
+    if not isinstance(detail, dict):
+        return None
+    for field_name in field_names:
+        number = _usage_number(detail.get(field_name))
+        if number is not None:
+            return number
+    return None
+
+
+def _usage_alias_number(usage: dict, *field_names):
+    for field_name in field_names:
+        number = _usage_number(usage.get(field_name))
+        if number is not None:
+            return number
+    return None
+
+
+def _reasoning_effort_value(body: dict):
+    """Extract the requested reasoning level from either wire format."""
+    if not isinstance(body, dict):
+        return None
+    effort = body.get("reasoning_effort")
+    if effort not in (None, ""):
+        return effort
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if effort not in (None, ""):
+            return effort
+    elif isinstance(reasoning, str) and reasoning:
+        return reasoning
+    return None
+
+
+def _is_xkiro_supplier(supplier: dict) -> bool:
+    """Identify xKiro without changing behavior for other suppliers."""
+    if not isinstance(supplier, dict):
+        return False
+    if str(supplier.get("name") or "").strip().casefold() == "xkiro":
+        return True
+    base_url = str(supplier.get("base_url") or "").strip()
+    if not base_url:
+        return False
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(base_url if "://" in base_url else f"//{base_url}")
+        host = (parsed.hostname or "").casefold()
+    except ValueError:
+        return False
+    return host == "api.xkiro.com"
+
+
+def _normalize_xkiro_chat_reasoning(body: dict, source_body: dict | None = None) -> dict:
+    """Convert Responses-style reasoning fields to xKiro Chat's parameter."""
+    if not isinstance(body, dict):
+        return body
+
+    source_effort = _reasoning_effort_value(source_body)
+    effort = source_effort if source_effort not in (None, "") else _reasoning_effort_value(body)
+    has_reasoning = "reasoning" in body
+    has_empty_effort = "reasoning_effort" in body and body.get("reasoning_effort") in (None, "")
+    if effort in (None, "") and not has_reasoning and not has_empty_effort:
+        return body
+
+    out = copy.deepcopy(body)
+    out.pop("reasoning", None)
+    if effort in (None, ""):
+        out.pop("reasoning_effort", None)
+    else:
+        out["reasoning_effort"] = effort
+    return out
+
+
+def _usage_cached_tokens(usage: dict) -> int:
+    """Read cached-input usage across common OpenAI-compatible schemas."""
+    detail_fields = (
+        "cached_tokens",
+        "cache_read_input_tokens",
+        "cache_read_tokens",
+        "cache_hit_tokens",
+    )
+    # Prefer an explicit non-zero cache count from either details object. Some
+    # gateways include an empty ``cached_tokens: 0`` details object while also
+    # returning a useful cache-read alias at the top level.
+    zero_seen = False
+    for detail_key in ("input_tokens_details", "prompt_tokens_details"):
+        detail = usage.get(detail_key)
+        if not isinstance(detail, dict):
+            continue
+        detail_values = []
+        for field_name in detail_fields:
+            value = _usage_number(detail.get(field_name))
+            if value is not None:
+                detail_values.append(value)
+        if any(value > 0 for value in detail_values):
+            return next(value for value in detail_values if value > 0)
+        if detail_values:
+            zero_seen = True
+    value = _usage_alias_number(usage, *detail_fields)
+    if value is not None:
+        if value > 0 or not zero_seen:
+            return value
+    return 0
+
+
 def _update_record_usage(rec: dict, usage) -> None:
     if not isinstance(usage, dict):
         return
-    rec["input_tokens"] = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
-    rec["cached_tokens"] = (
-        (usage.get("input_tokens_details") or {}).get("cached_tokens")
-        or (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
-        or usage.get("cached_tokens")
-        or 0
+    rec["input_tokens"] = _first_usage_number(
+        usage.get("input_tokens"), usage.get("prompt_tokens")
     )
-    rec["output_tokens"] = usage.get("output_tokens") or usage.get("completion_tokens") or 0
-    rec["reasoning_tokens"] = (
-        (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
-        or (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
-        or 0
+    rec["cached_tokens"] = _usage_cached_tokens(usage)
+    rec["output_tokens"] = _first_usage_number(
+        usage.get("output_tokens"), usage.get("completion_tokens")
     )
-    rec["total_tokens"] = usage.get("total_tokens") or (rec["input_tokens"] + rec["output_tokens"])
+    rec["reasoning_tokens"] = _first_usage_number(
+        _usage_detail_number(usage, "output_tokens_details", "reasoning_tokens"),
+        _usage_detail_number(usage, "completion_tokens_details", "reasoning_tokens"),
+        usage.get("reasoning_tokens"),
+    )
+    total = _usage_number(usage.get("total_tokens"))
+    rec["total_tokens"] = total if total is not None else (
+        rec["input_tokens"] + rec["output_tokens"]
+    )
 
 
 async def relay(request: Request, incoming_wire: str):
@@ -2576,6 +2795,10 @@ async def relay(request: Request, incoming_wire: str):
     else:
         out_body = chat_to_responses(body)
 
+    if upstream_wire == "chat":
+        out_body = _ensure_chat_stream_usage(out_body)
+        if _is_xkiro_supplier(supplier):
+            out_body = _normalize_xkiro_chat_reasoning(out_body, source_body=body)
     if not _should_forward_prompt_cache_key(supplier):
         out_body = _strip_prompt_cache_key(out_body)
 
@@ -2599,10 +2822,9 @@ async def relay(request: Request, incoming_wire: str):
         "reasoning_tokens": None,
         "total_tokens": None,
         "duration_ms": None,
-        "reasoning_effort": (
-            body.get("reasoning_effort")
-            or ((body.get("reasoning") or {}).get("effort") if isinstance(body.get("reasoning"), dict) else None)
-        ),
+        # Keep the recorded level aligned with either the incoming request
+        # or the converted payload sent to the upstream provider.
+        "reasoning_effort": _reasoning_effort_value(body) or _reasoning_effort_value(out_body),
         "error": None,
         "retry_count": 0,
     }
@@ -2706,6 +2928,11 @@ async def relay(request: Request, incoming_wire: str):
                 if incoming_wire != upstream_wire:
                     raise ValueError("Upstream returned invalid JSON for a non-stream request")
 
+            raw_usage_for_record = (
+                _raw_chat_usage(upstream_json)
+                if incoming_wire == "responses" and upstream_wire == "chat"
+                else None
+            )
             if incoming_wire == upstream_wire:
                 content_type = resp.headers.get("content-type") or "application/json"
                 result = Response(
@@ -2722,7 +2949,7 @@ async def relay(request: Request, incoming_wire: str):
                 result = JSONResponse(content=result_json, status_code=resp.status_code)
 
             if isinstance(result_json, dict):
-                _update_record_usage(rec, result_json.get("usage"))
+                _update_record_usage(rec, raw_usage_for_record or result_json.get("usage"))
                 if rec["status"] == "ok" and result_json.get("status") in ("failed", "incomplete"):
                     rec["status"] = result_json["status"]
             rec["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
@@ -3381,6 +3608,17 @@ function Start-Router {{
     Start-Process -FilePath $old -WorkingDirectory $dir
 }}
 
+function Get-Sha256([string] $path) {{
+    # Use .NET instead of Get-FileHash for compatibility with minimal Windows PowerShell 5.1 images.
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {{
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '')
+    }} finally {{
+        $sha.Dispose()
+    }}
+}}
+
 try {{
     if (-not (Test-Path -LiteralPath $new)) {{
         throw 'LLMRouter.new.exe not found'
@@ -3399,8 +3637,8 @@ try {{
         throw 'old executable is still locked'
     }}
 {force_fail_block}    Copy-Item -LiteralPath $new -Destination $old -Force
-    $hashNew = (Get-FileHash -LiteralPath $new -Algorithm SHA256).Hash
-    $hashOld = (Get-FileHash -LiteralPath $old -Algorithm SHA256).Hash
+    $hashNew = Get-Sha256 $new
+    $hashOld = Get-Sha256 $old
     if ($hashNew -ne $hashOld) {{
         throw 'SHA256 mismatch after copy'
     }}

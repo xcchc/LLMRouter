@@ -33,6 +33,11 @@ class FakeRequest:
         return self.body
 
 
+class HeaderRequest:
+    def __init__(self, headers):
+        self.headers = httpx.Headers(headers)
+
+
 class RetryThenSuccessClient:
     send_count = 0
 
@@ -126,7 +131,147 @@ class IncompleteResponseClient:
         pass
 
 
+class CaptureChatUsageClient:
+    requests = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def build_request(self, method, url, **kwargs):
+        request = httpx.Request(method, url, **kwargs)
+        type(self).requests.append(request)
+        return request
+
+    async def send(self, request, stream=False):
+        payload = (
+            b'data: {"choices":[{"index":0,"delta":{"content":"ok"},'
+            b'"finish_reason":"stop"}]}\n\n'
+            b'data: {"choices":[],"usage":{"prompt_tokens":100,'
+            b'"completion_tokens":8,"total_tokens":108,'
+            b'"cache_read_input_tokens":64}}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            stream=StaticStream(payload),
+        )
+
+    async def aclose(self):
+        pass
+
+
 class RouterStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def _relay_and_get_sent_chat_body(self, supplier, request_body, incoming_wire="chat"):
+        CaptureChatUsageClient.requests = []
+
+        async def find_supplier(_cfg, _model):
+            return supplier
+
+        with (
+            patch.object(router, "load_config", return_value={}),
+            patch.object(router, "find_supplier", new=find_supplier),
+            patch.object(router.httpx, "AsyncClient", CaptureChatUsageClient),
+            patch.object(router.stats, "record"),
+        ):
+            response = await router.relay(FakeRequest(request_body), incoming_wire)
+            _ = b"".join([chunk async for chunk in response.body_iterator])
+
+        return json.loads(CaptureChatUsageClient.requests[0].content)
+
+    async def test_responses_to_chat_requests_usage_frame_and_records_alias(self):
+        CaptureChatUsageClient.requests = []
+        records = []
+
+        async def find_supplier(_cfg, _model):
+            return {
+                "name": "xkiro",
+                "base_url": "https://api.xkiro.com/v1",
+                "api_key": "test-key",
+                "wire_api": "chat",
+            }
+
+        request = FakeRequest({
+            "model": "z-ai/glm-5.3-flash",
+            "input": "Say ok.",
+            "stream": True,
+        })
+        with (
+            patch.object(router, "load_config", return_value={}),
+            patch.object(router, "find_supplier", new=find_supplier),
+            patch.object(router.httpx, "AsyncClient", CaptureChatUsageClient),
+            patch.object(router.stats, "record", side_effect=records.append),
+        ):
+            response = await router.relay(request, "responses")
+            body = b"".join([chunk async for chunk in response.body_iterator])
+
+        sent = json.loads(CaptureChatUsageClient.requests[0].content)
+        self.assertEqual(sent["stream_options"], {"include_usage": True})
+        self.assertIn(b'"type": "response.completed"', body)
+        self.assertEqual(records[0]["input_tokens"], 100)
+        self.assertEqual(records[0]["cached_tokens"], 64)
+        self.assertEqual(records[0]["output_tokens"], 8)
+        self.assertEqual(records[0]["total_tokens"], 108)
+
+    async def test_xkiro_chat_normalizes_responses_reasoning_object(self):
+        sent = await self._relay_and_get_sent_chat_body(
+            {
+                "name": "xkiro",
+                "base_url": "https://api.xkiro.com/v1",
+                "api_key": "test-key",
+                "wire_api": "chat",
+            },
+            {
+                "model": "z-ai/glm-5.3-flash",
+                "messages": [{"role": "user", "content": "Say ok."}],
+                "reasoning": {"effort": "max"},
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(sent["reasoning_effort"], "max")
+        self.assertNotIn("reasoning", sent)
+
+    async def test_xkiro_chat_keeps_top_level_effort_from_responses_request(self):
+        sent = await self._relay_and_get_sent_chat_body(
+            {
+                "name": "xkiro",
+                "base_url": "https://api.xkiro.com/v1",
+                "api_key": "test-key",
+                "wire_api": "chat",
+            },
+            {
+                "model": "z-ai/glm-5.3-flash",
+                "input": "Say ok.",
+                "reasoning_effort": "max",
+                "stream": True,
+            },
+            incoming_wire="responses",
+        )
+
+        self.assertEqual(sent["reasoning_effort"], "max")
+        self.assertNotIn("reasoning", sent)
+
+    async def test_non_xkiro_chat_reasoning_shape_is_left_unchanged(self):
+        sent = await self._relay_and_get_sent_chat_body(
+            {
+                "name": "chat-provider",
+                "base_url": "https://provider.example/v1",
+                "api_key": "test-key",
+                "wire_api": "chat",
+            },
+            {
+                "model": "chat-model",
+                "messages": [{"role": "user", "content": "Say ok."}],
+                "reasoning": {"effort": "max"},
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(sent["reasoning"], {"effort": "max"})
+        self.assertNotIn("reasoning_effort", sent)
+
     async def test_relay_retries_two_upstream_500s_before_streaming_success(self):
         RetryThenSuccessClient.send_count = 0
         records = []
@@ -270,6 +415,94 @@ class RouterStreamTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RouterRequestConversionTests(unittest.TestCase):
+    def test_xkiro_identification_is_limited_to_name_or_exact_host(self):
+        self.assertTrue(router._is_xkiro_supplier({"name": "xkiro"}))
+        self.assertTrue(router._is_xkiro_supplier({"base_url": "https://api.xkiro.com/v1"}))
+        self.assertFalse(router._is_xkiro_supplier({"name": "xkiro-compatible", "base_url": "https://provider.example/v1"}))
+        self.assertFalse(router._is_xkiro_supplier({"base_url": "https://api.xkiro.com.evil.example/v1"}))
+
+    def test_xkiro_chat_reasoning_uses_top_level_reasoning_effort(self):
+        body = {
+            "model": "z-ai/glm-5.3-flash",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning": {"effort": "max"},
+        }
+
+        out = router._normalize_xkiro_chat_reasoning(body)
+
+        self.assertEqual(out["reasoning_effort"], "max")
+        self.assertNotIn("reasoning", out)
+        self.assertIn("reasoning", body)
+
+    def test_xkiro_chat_reasoning_preserves_top_level_effort(self):
+        body = {
+            "model": "z-ai/glm-5.3-flash",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "max",
+        }
+
+        out = router._normalize_xkiro_chat_reasoning(body)
+
+        self.assertEqual(out["reasoning_effort"], "max")
+        self.assertNotIn("reasoning", out)
+
+    def test_responses_to_chat_enables_usage_frame_for_streaming(self):
+        chat = router.responses_to_chat({
+            "model": "xkiro-model",
+            "stream": True,
+            "input": "hello",
+        })
+
+        self.assertEqual(chat["stream_options"], {"include_usage": True})
+
+    def test_responses_to_chat_preserves_stream_options_and_enables_usage(self):
+        chat = router.responses_to_chat({
+            "model": "chat-model",
+            "stream": True,
+            "stream_options": {"custom": "keep"},
+            "input": "hello",
+        })
+
+        self.assertEqual(
+            chat["stream_options"],
+            {"custom": "keep", "include_usage": True},
+        )
+
+    def test_chat_stream_usage_merges_existing_stream_options(self):
+        body = {
+            "model": "chat-model",
+            "stream": True,
+            "stream_options": {"custom": "keep"},
+        }
+
+        out = router._ensure_chat_stream_usage(body)
+
+        self.assertEqual(
+            out["stream_options"],
+            {"custom": "keep", "include_usage": True},
+        )
+        self.assertEqual(body["stream_options"], {"custom": "keep"})
+
+    def test_responses_to_chat_preserves_explicit_usage_disable(self):
+        chat = router.responses_to_chat({
+            "model": "chat-model",
+            "stream": True,
+            "stream_options": {"include_usage": False},
+            "input": "hello",
+        })
+
+        self.assertEqual(chat["stream_options"], {"include_usage": False})
+
+    def test_responses_to_chat_carries_reasoning_effort_for_xkiro_normalization(self):
+        chat = router.responses_to_chat({
+            "model": "z-ai/glm-5.3-flash",
+            "reasoning": {"effort": "max"},
+            "input": "hello",
+        })
+
+        self.assertEqual(chat["reasoning_effort"], "max")
+
+
     def test_standalone_reasoning_is_attached_to_tool_call_message(self):
         chat = router.responses_to_chat({
             "model": "deepseek-v4-flash",
@@ -1325,6 +1558,16 @@ class ChatToResponsesTests(unittest.TestCase):
 
 
 class UsageSnifferTests(unittest.TestCase):
+    def test_sniffs_chat_usage_frame_with_empty_choices(self):
+        sniffer = router.UsageSniffer()
+        sniffer.feed(
+            b'data: {"choices":[],"usage":{"prompt_tokens":100,'
+            b'"completion_tokens":8,"total_tokens":108,'
+            b'"cache_read_input_tokens":64}}\n\n'
+        )
+
+        self.assertEqual(sniffer.usage["cache_read_input_tokens"], 64)
+
     def test_sniffs_failed_incomplete_and_completed_statuses(self):
         failed = router.UsageSniffer()
         failed.feed(b'data: {"type":"response.failed"}\n\n')
@@ -1343,7 +1586,113 @@ class UsageSnifferTests(unittest.TestCase):
         self.assertEqual(completed.usage["total_tokens"], 5)
 
 
+class UsageRecordTests(unittest.TestCase):
+    def test_cache_read_aliases_are_recorded(self):
+        record = {}
+        router._update_record_usage(record, {
+            "prompt_tokens": 100,
+            "completion_tokens": 8,
+            "total_tokens": 108,
+            "cache_read_input_tokens": 64,
+        })
+
+        self.assertEqual(record["input_tokens"], 100)
+        self.assertEqual(record["cached_tokens"], 64)
+        self.assertEqual(record["output_tokens"], 8)
+        self.assertEqual(record["total_tokens"], 108)
+
+    def test_zero_usage_values_are_not_replaced_by_fallback_values(self):
+        record = {}
+        router._update_record_usage(record, {
+            "input_tokens": 0,
+            "prompt_tokens": 99,
+            "input_tokens_details": {"cached_tokens": 0},
+            "cached_tokens": 64,
+            "output_tokens": 0,
+            "completion_tokens": 8,
+            "total_tokens": 0,
+        })
+
+        self.assertEqual(record["input_tokens"], 0)
+        # An explicit non-zero top-level alias is still useful when a gateway
+        # emits a zero-valued details object alongside it.
+        self.assertEqual(record["cached_tokens"], 64)
+        self.assertEqual(record["output_tokens"], 0)
+        self.assertEqual(record["total_tokens"], 0)
+
+
 class ResponsesToChatTests(unittest.TestCase):
+    def test_reasoning_terminal_summary_does_not_duplicate_streamed_delta(self):
+        converter = router.ResponsesToChat("responses-model")
+        converter.on_event({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "rs_1",
+            "delta": "Think first.",
+        })
+
+        duplicate = converter.on_event({
+            "type": "response.output_item.done",
+            "item": {
+                "id": "rs_1",
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "Think first."}],
+            },
+        })
+
+        self.assertEqual(duplicate, [])
+
+    def test_reasoning_terminal_summary_only_emits_unseen_suffix(self):
+        converter = router.ResponsesToChat("responses-model")
+        converter.on_event({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "rs_1",
+            "delta": "Think first.",
+        })
+
+        suffix = converter.on_event({
+            "type": "response.output_item.done",
+            "item": {
+                "id": "rs_1",
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "Think first. Then act."}],
+            },
+        })
+
+        self.assertEqual(suffix[0]["choices"][0]["delta"]["reasoning_content"], " Then act.")
+
+
+class UpstreamHeaderTests(unittest.TestCase):
+    def test_forwards_codex_identity_but_filters_switch_marker(self):
+        request = HeaderRequest({
+            "user-agent": "codex_cli_rs",
+            "x-codex-turn-id": "turn_1",
+            "x-openai-actor-authorization": "CODEX_SWITCH_LOCAL_PROXY",
+            "openai-beta": "responses=v1",
+            "authorization": "Bearer local-placeholder",
+        })
+
+        headers = router.upstream_headers(
+            {"api_key": "upstream-key", "forward_client_identity": True},
+            request,
+        )
+
+        self.assertEqual(headers["User-Agent"], "codex_cli_rs")
+        self.assertEqual(headers["x-codex-turn-id"], "turn_1")
+        self.assertEqual(headers["OpenAI-Beta"], "responses=v1")
+        self.assertEqual(headers["Authorization"], "Bearer upstream-key")
+        self.assertNotIn("x-openai-actor-authorization", {
+            key.lower() for key in headers
+        })
+
+    def test_does_not_forward_client_identity_when_disabled(self):
+        request = HeaderRequest({"user-agent": "codex_cli_rs"})
+
+        headers = router.upstream_headers(
+            {"api_key": "upstream-key", "forward_client_identity": False},
+            request,
+        )
+
+        self.assertNotIn("User-Agent", headers)
     def test_incomplete_terminal_event_marks_length_finish_reason(self):
         converter = router.ResponsesToChat("responses-model")
         converter.on_event({
