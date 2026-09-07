@@ -162,15 +162,74 @@ class CaptureChatUsageClient:
         pass
 
 
+class FailingResponsesStream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b'data: {"type":"response.created","response":{"status":"in_progress"}}\n\n'
+        raise httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)"
+        )
+
+
+class FailingResponsesClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def build_request(self, method, url, **kwargs):
+        return httpx.Request(method, url, **kwargs)
+
+    async def send(self, request, stream=False):
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            stream=FailingResponsesStream(),
+        )
+
+    async def aclose(self):
+        pass
+
+
+class MissingTerminalResponsesStream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b'data: {"type":"response.created","response":{"status":"in_progress"}}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+
+
+class MissingTerminalResponsesClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def build_request(self, method, url, **kwargs):
+        return httpx.Request(method, url, **kwargs)
+
+    async def send(self, request, stream=False):
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            stream=MissingTerminalResponsesStream(),
+        )
+
+    async def aclose(self):
+        pass
+
+
 class RouterStreamTests(unittest.IsolatedAsyncioTestCase):
-    async def _relay_and_get_sent_chat_body(self, supplier, request_body, incoming_wire="chat"):
+    async def _relay_and_get_sent_chat_body(
+        self,
+        supplier,
+        request_body,
+        incoming_wire="chat",
+        load_config_result=None,
+    ):
         CaptureChatUsageClient.requests = []
 
         async def find_supplier(_cfg, _model):
             return supplier
 
         with (
-            patch.object(router, "load_config", return_value={}),
+            patch.object(router, "load_config", return_value=load_config_result or {}),
             patch.object(router, "find_supplier", new=find_supplier),
             patch.object(router.httpx, "AsyncClient", CaptureChatUsageClient),
             patch.object(router.stats, "record"),
@@ -213,6 +272,83 @@ class RouterStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(records[0]["cached_tokens"], 64)
         self.assertEqual(records[0]["output_tokens"], 8)
         self.assertEqual(records[0]["total_tokens"], 108)
+
+    async def test_direct_responses_transport_error_becomes_response_failed(self):
+        records = []
+
+        async def find_supplier(_cfg, _model):
+            return {
+                "name": "pixel",
+                "base_url": "https://ai-pixel.online",
+                "api_key": "test-key",
+                "wire_api": "responses",
+            }
+
+        request = FakeRequest({
+            "model": "gpt-5.6-luna",
+            "input": "Say ok.",
+            "stream": True,
+        })
+        with (
+            patch.object(router, "load_config", return_value={}),
+            patch.object(router, "find_supplier", new=find_supplier),
+            patch.object(router.httpx, "AsyncClient", FailingResponsesClient),
+            patch.object(router.stats, "record", side_effect=records.append),
+        ):
+            response = await router.relay(request, "responses")
+            body = b"".join([chunk async for chunk in response.body_iterator])
+
+        self.assertIn(b'"type": "response.failed"', body)
+        self.assertIn(b"upstream_stream_error", body)
+        self.assertEqual(records[0]["status"], "error")
+        self.assertIn("incomplete chunked read", records[0]["error"])
+
+    async def test_direct_responses_without_completed_becomes_response_failed(self):
+        records = []
+
+        async def find_supplier(_cfg, _model):
+            return {
+                "name": "pixel",
+                "base_url": "https://ai-pixel.online",
+                "api_key": "test-key",
+                "wire_api": "responses",
+            }
+
+        request = FakeRequest({
+            "model": "gpt-5.6-luna",
+            "input": "Say ok.",
+            "stream": True,
+        })
+        with (
+            patch.object(router, "load_config", return_value={}),
+            patch.object(router, "find_supplier", new=find_supplier),
+            patch.object(router.httpx, "AsyncClient", MissingTerminalResponsesClient),
+            patch.object(router.stats, "record", side_effect=records.append),
+        ):
+            response = await router.relay(request, "responses")
+            body = b"".join([chunk async for chunk in response.body_iterator])
+
+        self.assertIn(b'"type": "response.failed"', body)
+        self.assertEqual(records[0]["status"], "failed")
+        self.assertIn("response.completed", records[0]["error"])
+
+    async def test_chat_to_responses_relay_applies_configured_effort(self):
+        sent = await self._relay_and_get_sent_chat_body(
+            {
+                "name": "pixel",
+                "base_url": "https://ai-pixel.online",
+                "api_key": "test-key",
+                "wire_api": "responses",
+            },
+            {
+                "model": "gpt-6-astra",
+                "messages": [{"role": "user", "content": "Say ok."}],
+                "stream": True,
+            },
+            load_config_result={"model_reasoning_efforts": {"gpt-6-astra": "xhigh"}},
+        )
+
+        self.assertEqual(sent["reasoning"], {"effort": "xhigh"})
 
     async def test_xkiro_chat_normalizes_responses_reasoning_object(self):
         sent = await self._relay_and_get_sent_chat_body(
@@ -502,6 +638,92 @@ class RouterRequestConversionTests(unittest.TestCase):
 
         self.assertEqual(chat["reasoning_effort"], "max")
 
+    def test_configured_reasoning_effort_fills_responses_upstream(self):
+        cfg = {"model_reasoning_efforts": {"gpt-6-astra": "xhigh"}}
+        body = {
+            "model": "gpt-6-astra",
+            "messages": [{"role": "user", "content": "Say ok."}],
+        }
+
+        out = router._apply_configured_reasoning_effort(
+            router.chat_to_responses(body),
+            cfg,
+            body["model"],
+            "responses",
+            source_body=body,
+        )
+
+        self.assertEqual(out["reasoning"], {"effort": "xhigh"})
+
+    def test_configured_reasoning_effort_fills_chat_upstream(self):
+        cfg = {"model_reasoning_efforts": {"gpt-6-astra": "xhigh"}}
+        body = {
+            "model": "gpt-6-astra",
+            "messages": [{"role": "user", "content": "Say ok."}],
+        }
+
+        out = router._apply_configured_reasoning_effort(
+            dict(body),
+            cfg,
+            body["model"],
+            "chat",
+            source_body=body,
+        )
+
+        self.assertEqual(out["reasoning_effort"], "xhigh")
+
+    def test_configured_reasoning_effort_fills_xkiro_chat_model(self):
+        cfg = {"model_reasoning_efforts": {"z-ai/glm-5.3-flash": "max"}}
+        body = {
+            "model": "z-ai/glm-5.3-flash",
+            "messages": [{"role": "user", "content": "Say ok."}],
+        }
+
+        out = router._apply_configured_reasoning_effort(
+            dict(body),
+            cfg,
+            body["model"],
+            "chat",
+            source_body=body,
+        )
+
+        self.assertEqual(out["reasoning_effort"], "max")
+
+    def test_configured_reasoning_effort_does_not_override_explicit_value(self):
+        cfg = {"model_reasoning_efforts": {"gpt-6-astra": "xhigh"}}
+        body = {
+            "model": "gpt-6-astra",
+            "messages": [{"role": "user", "content": "Say ok."}],
+            "reasoning_effort": "low",
+        }
+
+        out = router._apply_configured_reasoning_effort(
+            router.chat_to_responses(body),
+            cfg,
+            body["model"],
+            "responses",
+            source_body=body,
+        )
+
+        self.assertEqual(out["reasoning"], {"effort": "low"})
+
+    def test_configured_reasoning_effort_preserves_explicit_empty_value(self):
+        cfg = {"model_reasoning_efforts": {"gpt-6-astra": "xhigh"}}
+        body = {
+            "model": "gpt-6-astra",
+            "messages": [{"role": "user", "content": "Say ok."}],
+            "reasoning_effort": "",
+        }
+
+        out = router._apply_configured_reasoning_effort(
+            router.chat_to_responses(body),
+            cfg,
+            body["model"],
+            "responses",
+            source_body=body,
+        )
+
+        self.assertNotIn("reasoning", out)
 
     def test_standalone_reasoning_is_attached_to_tool_call_message(self):
         chat = router.responses_to_chat({

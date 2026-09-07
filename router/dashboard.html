@@ -51,9 +51,17 @@ main{padding:22px 28px 60px;max-width:1560px;margin:0 auto}
 .grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:18px}
 @media(max-width:900px){.grid2{grid-template-columns:minmax(0,1fr)}}
 .tblwrap{overflow:auto;max-height:380px}
+.page-pane{min-height:calc(100vh - 78px)}
+.model-route-table{overflow-x:auto}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th{color:var(--mut);font-weight:600;text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap;position:sticky;top:0;background:var(--card2)}
 td{padding:8px 10px;border-bottom:1px solid rgba(38,43,69,.55);white-space:nowrap}
+#tblModelMap tbody tr[draggable]{cursor:grab}
+#tblModelMap tbody tr.dragging{opacity:.55}
+#tblModelMap .drag-cell{cursor:grab;color:var(--mut);text-align:center;user-select:none}
+.compat-grid{display:grid;grid-template-columns:1fr;gap:5px;min-width:220px}
+.compat-grid label{display:block;font-size:11px;color:var(--mut);margin:0}
+.compat-grid select{width:100%;padding:4px 8px;font-size:12px}
 tr:hover td{background:rgba(255,255,255,.025)}
 .num{font-variant-numeric:tabular-nums;text-align:right}
 .badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;background:rgba(124,108,255,.18);color:#b9b1ff;border:1px solid rgba(124,108,255,.35)}
@@ -176,30 +184,24 @@ textarea{width:100%;min-height:70px;resize:vertical}
     <div class="supplier-list" id="supplierList"></div>
   </section>
 
-  <section id="tab-models" class="tabpane">
-    <div class="card">
+  <section id="tab-models" class="tabpane page-pane">
       <h3>模型路由</h3>
       <div class="form-row">
-        <input id="newModelName" placeholder="模型名，如 gpt-5.6-sol" style="flex:1;min-width:200px">
         <select id="newModelSupplier" style="min-width:140px"></select>
+        <select id="newModelName" style="flex:1;min-width:240px"></select>
         <select id="newModelMode" style="min-width:170px">
           <option value="map">路由映射到该供应商</option>
           <option value="manual">加入供应商手动模型列表</option>
         </select>
         <button class="btn primary" id="btnAddModel">添加模型</button>
       </div>
-      <div class="tblwrap"><table id="tblModelMap"></table></div>
+      <div class="muted" id="newModelHint" style="margin-top:8px">选择供应商后自动获取上游模型；可拖动路由行排序，模型价格直接在路由行设置。</div>
+      <div class="model-route-table"><table id="tblModelMap"></table></div>
       <div class="form-row" style="margin-top:16px">
         <label>默认供应商（兜底）</label>
         <select id="defaultSupplier" style="min-width:180px"></select>
         <button class="btn" id="btnSaveDefault">保存</button>
       </div>
-    </div>
-    <div class="card" style="margin-top:14px">
-      <h3>模型列表（来自各上游 / 手动配置）<button class="btn ghost sm" id="btnFetchModels">从上游获取</button><button class="btn ghost sm" id="btnRefreshMerged">刷新</button></h3>
-      <div class="tblwrap"><table id="tblMerged"></table></div>
-      <div id="hiddenModels" style="margin-top:10px"></div>
-    </div>
   </section>
 
   <section id="tab-settings" class="tabpane">
@@ -671,52 +673,127 @@ function openSupplierModal(name){
   }).catch(e => toast(e.message, 'bad'));
 }
 // ---------- models ----------
+let modelRouteRequestId = 0;
+
+function setModelRouteOptions(models, selectedModel=''){
+  const select = $('#newModelName');
+  const unique = [];
+  [...(models || []), selectedModel].forEach(mid => {
+    const model = String(mid || '').trim();
+    if(model && !unique.includes(model)) unique.push(model);
+  });
+  select.innerHTML = unique.length
+    ? '<option value="">（选择模型）</option>' + unique.map(mid => `<option value="${esc(mid)}">${esc(mid)}</option>`).join('')
+    : '<option value="">（暂无可用模型）</option>';
+  if(selectedModel && unique.includes(selectedModel)) select.value = selectedModel;
+}
+
+async function refreshModelRouteOptions(supplierName, selectedModel=''){
+  const requestId = ++modelRouteRequestId;
+  const hint = $('#newModelHint');
+  setModelRouteOptions([], selectedModel);
+  if(!supplierName){
+    hint.textContent = '请先选择供应商。';
+    return;
+  }
+  const supplier = (window.__routerConfigSuppliers || []).find(s => s.name === supplierName);
+  const manual = supplier && Array.isArray(supplier.models) ? supplier.models : [];
+  setModelRouteOptions(manual, selectedModel);
+  hint.textContent = manual.length ? '正在刷新上游模型列表…' : '正在获取上游模型列表…';
+  try{
+    const res = await api('/api/suppliers/' + encodeURIComponent(supplierName) + '/fetch-models', {method:'POST'});
+    if(requestId !== modelRouteRequestId) return;
+    setModelRouteOptions([...(res.models || []), ...manual], selectedModel);
+    hint.textContent = `已获取 ${Number(res.count ?? (res.models || []).length)} 个模型；选择后点击“添加模型”。`;
+  }catch(e){
+    if(requestId !== modelRouteRequestId) return;
+    hint.textContent = manual.length
+      ? '上游获取失败，当前显示供应商已保存的手动模型。'
+      : '上游获取失败；请检查地址/Key，或在供应商设置中填写手动模型。';
+  }
+}
+
 async function loadModelsTab(){
   try{
     const cfg = await api('/api/config');
+    window.__routerConfigSuppliers = cfg.suppliers || [];
+    const previousSupplier = $('#newModelSupplier').value;
     const supOpts = cfg.suppliers.map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
     $('#newModelSupplier').innerHTML = supOpts;
     $('#defaultSupplier').innerHTML = '<option value="">（不设置）</option>' + supOpts;
     $('#defaultSupplier').value = cfg.default_supplier || '';
+    const currentSupplier = cfg.suppliers.some(s => s.name === previousSupplier)
+      ? previousSupplier
+      : (cfg.suppliers[0] && cfg.suppliers[0].name) || '';
+    $('#newModelSupplier').value = currentSupplier;
+    await refreshModelRouteOptions(currentSupplier);
     const mm = cfg.model_map || {};
+    const mo = cfg.model_overrides || {};
     const keys = Object.keys(mm);
-    $('#tblModelMap').innerHTML = `<thead><tr><th>模型名</th><th>路由到供应商</th><th></th></tr></thead><tbody>${
-      keys.map(k => `<tr data-model="${esc(k)}"><td>${esc(k)}</td><td><select class="mm-sel">${supOpts.replace(/<option value="([^"]+)"/g, (m, v) => `<option value="${esc(v)}"${v === mm[k] ? ' selected' : ''}`)}</select></td><td><button class="btn sm danger" onclick="delModelMap('${esc(k)}')">删除</button></td></tr>`).join('')
-      || '<tr><td colspan="3" class="empty">暂无映射。在下方输入模型名添加，或依赖各上游的模型列表自动路由。</td></tr>'
+    $('#tblModelMap').innerHTML = `<thead><tr><th></th><th>模型名</th><th>路由到供应商</th><th>价格</th><th>兼容设置</th><th></th></tr></thead><tbody>${
+      keys.map(k => {
+        const ov = mo[k] || {};
+        const sanitize = ov.openai_sanitize == null ? 'inherit' : String(ov.openai_sanitize);
+        const cacheKey = ov.forward_prompt_cache_key == null ? 'inherit' : String(ov.forward_prompt_cache_key);
+        return `<tr data-model="${esc(k)}" draggable="true"><td class="drag-cell" title="拖动排序">⋮⋮</td><td>${esc(k)}</td><td><select class="mm-sel">${supOpts.replace(/<option value="([^"]+)"/g, (m, v) => `<option value="${esc(v)}"${v === mm[k] ? ' selected' : ''}`)}</select></td><td>${modelPriceText(k, mm[k], cfg)}</td><td><div class="compat-grid"><label>Responses 字段</label><select class="mo-sel" data-key="openai_sanitize"><option value="inherit"${sanitize === 'inherit' ? ' selected' : ''}>跟随供应商</option><option value="false"${sanitize === 'false' ? ' selected' : ''}>完整透传</option><option value="true"${sanitize === 'true' ? ' selected' : ''}>兼容清洗</option></select><label>prompt_cache_key</label><select class="mo-sel" data-key="forward_prompt_cache_key"><option value="inherit"${cacheKey === 'inherit' ? ' selected' : ''}>跟随供应商</option><option value="true"${cacheKey === 'true' ? ' selected' : ''}>透传</option><option value="false"${cacheKey === 'false' ? ' selected' : ''}>删除</option></select></div></td><td><button class="btn sm" data-price-model="${esc(k)}" data-price-supplier="${esc(mm[k])}">设价</button> <button class="btn sm danger" data-del-model="${esc(k)}">删除</button></td></tr>`;
+      }).join('')
+      || '<tr><td colspan="6" class="empty">暂无映射。在上方选择供应商和模型后添加。</td></tr>'
     }</tbody>`;
     document.querySelectorAll('.mm-sel').forEach(sel => sel.addEventListener('change', saveModelMap));
-    await loadMerged();
+    document.querySelectorAll('.mo-sel').forEach(sel => sel.addEventListener('change', saveModelMap));
+    document.querySelectorAll('[data-price-model]').forEach(btn => btn.onclick = () => openModelPriceModal(btn.dataset.priceModel, btn.dataset.priceSupplier));
+    document.querySelectorAll('[data-del-model]').forEach(btn => btn.onclick = () => delModelMap(btn.dataset.delModel));
+    setupModelMapDrag();
   }catch(e){ toast('加载失败：' + e.message, 'bad'); }
+}
+function setupModelMapDrag(){
+  const tbody = $('#tblModelMap tbody');
+  if(!tbody) return;
+  let draggingRow = null;
+  tbody.querySelectorAll('tr[data-model]').forEach(row => {
+    row.ondragstart = e => {
+      draggingRow = row;
+      row.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', row.dataset.model || '');
+    };
+    row.ondragend = () => {
+      row.classList.remove('dragging');
+      draggingRow = null;
+    };
+    row.ondragover = e => {
+      e.preventDefault();
+      if(!draggingRow || row === draggingRow) return;
+      const rect = row.getBoundingClientRect();
+      const before = e.clientY < rect.top + rect.height / 2;
+      tbody.insertBefore(draggingRow, before ? row : row.nextSibling);
+    };
+    row.ondrop = e => {
+      e.preventDefault();
+      saveModelMap();
+    };
+  });
 }
 async function saveModelMap(){
   const cfg = await api('/api/config');
   const mm = {};
-  document.querySelectorAll('#tblModelMap tbody tr[data-model]').forEach(tr => { mm[tr.dataset.model] = tr.querySelector('select').value; });
+  const mo = {};
+  document.querySelectorAll('#tblModelMap tbody tr[data-model]').forEach(tr => {
+    mm[tr.dataset.model] = tr.querySelector('select').value;
+    tr.querySelectorAll('.mo-sel').forEach(sel => {
+      if(sel.value === 'inherit') return;
+      mo[tr.dataset.model] = mo[tr.dataset.model] || {};
+      mo[tr.dataset.model][sel.dataset.key] = sel.value === 'true';
+    });
+  });
   try{
-    await api('/api/model_map', {method:'PUT', body: JSON.stringify({model_map: mm, default_supplier: $('#defaultSupplier').value})});
+    await api('/api/model_map', {method:'PUT', body: JSON.stringify({model_map: mm, model_overrides: mo, default_supplier: $('#defaultSupplier').value})});
     toast('已保存'); loadModelsTab();
   }catch(e){ toast(e.message, 'bad'); }
 }
 async function delModelMap(model){
-  try{ await api('/api/model_map/' + encodeURIComponent(model), {method:'DELETE'}); toast('已删除'); loadModelsTab(); }
+  try{ await api('/api/model_map?model=' + encodeURIComponent(model), {method:'DELETE'}); toast('已删除'); loadModelsTab(); }
   catch(e){ toast(e.message, 'bad'); }
-}
-async function loadMerged(){
-  try{
-    const [cfg, merged] = await Promise.all([api('/api/config'), api('/api/merged-models')]);
-    const {models, hidden} = merged;
-    const rows = models.map(m => `<tr>
-      <td>${esc(m.id)}</td>
-      <td>${esc(m.supplier)}</td>
-      <td>${m.source === 'map' ? '<span class="badge mut">路由映射</span>' : m.source === 'manual' ? '<span class="badge">手动</span>' : '<span class="badge chat">上游</span>'}</td>
-      <td>${modelPriceText(m.id, m.supplier, cfg)}</td>
-      <td><button class="btn sm" onclick="openModelPriceModal('${esc(m.id)}','${esc(m.supplier)}')">设价</button> <button class="btn sm danger" onclick="hideModel('${esc(m.supplier)}','${esc(m.id)}',${m.source === 'map'})">隐藏</button></td>
-    </tr>`).join('');
-    $('#tblMerged').innerHTML = `<thead><tr><th>模型</th><th>来源供应商</th><th>来源</th><th>价格（元/百万）</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="5" class="empty">暂无模型（检查供应商地址/Key，或点"从上游获取"）</td></tr>'}</tbody>`;
-    $('#hiddenModels').innerHTML = hidden.length
-      ? `<div class="muted">已隐藏 ${hidden.length} 个模型：${hidden.map(h => esc(h.id) + '（' + esc(h.supplier) + '）').join('、')}　<button class="btn sm" onclick="unhideAll()">全部恢复</button></div>`
-      : '';
-  }catch(e){}
 }
 function modelPriceText(model, supplier, cfg){
   const mp = (cfg.model_prices || {})[model] || {};
@@ -761,28 +838,16 @@ function openModelPriceModal(model, supplier){
         price_output_per_1m: $('#mpOut').value === '' ? null : Number($('#mpOut').value),
         price_input_cached_per_1m: $('#mpCIn').value === '' ? null : Number($('#mpCIn').value),
       };
-      try{ await api('/api/model-price', {method:'PUT', body: JSON.stringify(data)}); toast('已保存'); modal.classList.add('hidden'); loadMerged(); }
+      try{ await api('/api/model-price', {method:'PUT', body: JSON.stringify(data)}); toast('已保存'); modal.classList.add('hidden'); loadModelsTab(); }
       catch(e){ toast(e.message, 'bad'); }
     };
     const clearBtn = $('#mpClear');
     if(clearBtn) clearBtn.onclick = async () => {
-      try{ await api('/api/model-price/' + encodeURIComponent(model), {method:'DELETE'}); toast('已恢复默认'); modal.classList.add('hidden'); loadMerged(); }
+      try{ await api('/api/model-price?model=' + encodeURIComponent(model), {method:'DELETE'}); toast('已恢复默认'); modal.classList.add('hidden'); loadModelsTab(); }
       catch(e){ toast(e.message, 'bad'); }
     };
     $('#mpCancel').onclick = () => modal.classList.add('hidden');
   }).catch(e => toast(e.message, 'bad'));
-}
-async function hideModel(supplier, model, isMap){
-  if(!confirm(`确定隐藏模型「${model}」？隐藏后它不再出现在列表，也不会被路由到。`)) return;
-  try{
-    if(isMap){ await api('/api/model_map/' + encodeURIComponent(model), {method:'DELETE'}); }
-    else { await api('/api/suppliers/' + encodeURIComponent(supplier) + '/models/' + encodeURIComponent(model), {method:'DELETE'}); }
-    toast('已隐藏'); loadMerged();
-  }catch(e){ toast(e.message, 'bad'); }
-}
-async function unhideAll(){
-  try{ await api('/api/unhide-models', {method:'POST'}); toast('已恢复全部隐藏模型'); loadMerged(); }
-  catch(e){ toast(e.message, 'bad'); }
 }
 // ---------- settings ----------
 async function loadSettings(){
@@ -886,23 +951,18 @@ $('#btnTheme').onclick = () => {
 };
 $('#btnAddModel').onclick = async () => {
   const model = $('#newModelName').value.trim();
-  if(!model){ toast('请输入模型名', 'bad'); return; }
+  if(!model){ toast('请先选择模型', 'bad'); return; }
   try{
     await api('/api/models', {method:'POST', body: JSON.stringify({model, supplier: $('#newModelSupplier').value, mode: $('#newModelMode').value})});
-    toast('已添加'); $('#newModelName').value = ''; loadModelsTab();
+    toast('已添加'); await loadModelsTab();
   }catch(e){ toast(e.message, 'bad'); }
+};
+$('#newModelSupplier').onchange = () => refreshModelRouteOptions($('#newModelSupplier').value, '');
+$('#newModelName').onchange = () => {
+  const selected = $('#newModelName').value;
+  if(selected) $('#newModelHint').textContent = `已选择模型：${selected}`;
 };
 $('#btnSaveDefault').onclick = saveModelMap;
-$('#btnRefreshMerged').onclick = loadMerged;
-$('#btnFetchModels').onclick = async () => {
-  const b = $('#btnFetchModels'); b.disabled = true; b.textContent = '获取中…';
-  try{
-    const r = await api('/api/fetch-models', {method:'POST'});
-    toast(`已刷新 ${r.refreshed.length} 个供应商` + (r.failed.length ? `，${r.failed.length} 个失败（检查地址/Key）` : ''));
-    loadMerged();
-  }catch(e){ toast(e.message, 'bad'); }
-  finally{ b.disabled = false; b.textContent = '从上游获取'; }
-};
 $('#btnSaveSettings').onclick = saveSettings;
 $('#btnCheckUpdate').onclick = loadUpdateStatus;
 $('#btnApplyUpdate').onclick = applyUpdate;

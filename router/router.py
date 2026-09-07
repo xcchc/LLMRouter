@@ -45,7 +45,7 @@ else:
 CONFIG_PATH = BASE_DIR / "config.json"
 DASHBOARD_PATH = _DATA_DIR / "dashboard.html"
 MODEL_CACHE_TTL = 600  # 上游模型列表缓存秒数
-APP_VERSION = "2026.09.03.2"
+APP_VERSION = "2026.09.05.1"
 
 app = FastAPI(title="LLM Router", docs_url=None, redoc_url=None)
 
@@ -99,9 +99,11 @@ def normalized_config(cfg: dict) -> dict:
         "open_browser": bool(cfg.get("open_browser", True)),
         "suppliers": cfg.get("suppliers") or [],
         "model_map": cfg.get("model_map") or {},
+        "model_overrides": cfg.get("model_overrides") or {},
         "default_supplier": cfg.get("default_supplier") or "",
         "model_blacklist": cfg.get("model_blacklist") or {},
         "model_prices": cfg.get("model_prices") or {},
+        "model_reasoning_efforts": cfg.get("model_reasoning_efforts") or {},
     }
 
 
@@ -168,13 +170,59 @@ async def merged_model_list(cfg: dict) -> list:
     return result
 
 
+def configured_model_list(cfg: dict) -> list:
+    """Return only models explicitly added in the model-routing UI.
+
+    The dashboard still uses :func:`merged_model_list` to inspect every model
+    discovered from upstreams.  The public ``/v1/models`` catalog is kept
+    intentionally narrower so clients such as Codex Switch only see models
+    that the user explicitly routed or added to a supplier's manual list.
+    """
+    result = []
+    seen = set()
+
+    # Explicit mappings are the most specific routing choice, so list them
+    # first and keep the historical ``model_map`` owner marker.
+    for alias, supplier_name in (cfg.get("model_map") or {}).items():
+        model = str(alias).strip()
+        if not model or model in seen:
+            continue
+        if model in _blacklisted_ids(cfg, str(supplier_name)):
+            continue
+        seen.add(model)
+        result.append({"id": model, "object": "model", "owned_by": "model_map"})
+
+    # A non-empty supplier.models list is the other explicit way the UI adds
+    # a model.  Do not consult the upstream cache here: undisclosed upstream
+    # models must stay out of the client-facing catalog.
+    for supplier in cfg.get("suppliers", []):
+        supplier_name = str(supplier.get("name", ""))
+        hidden = _blacklisted_ids(cfg, supplier_name)
+        manual_models = supplier.get("models") or []
+        if not isinstance(manual_models, (list, tuple)):
+            continue
+        for model in manual_models:
+            model = str(model).strip()
+            if not model or model in seen or model in hidden:
+                continue
+            seen.add(model)
+            result.append({"id": model, "object": "model", "owned_by": supplier_name})
+
+    return result
+
+
 async def find_supplier(cfg: dict, model: str) -> dict | None:
     """按模型名找供应商：model_map 显式指定 > 上游模型列表命中 > default_supplier。"""
     if model in cfg.get("model_map", {}):
         target = cfg["model_map"][model]
         for s in cfg.get("suppliers", []):
             if s.get("name") == target:
-                return s
+                supplier = copy.deepcopy(s)
+                overrides = (cfg.get("model_overrides") or {}).get(model) or {}
+                for key in MODEL_OVERRIDE_KEYS:
+                    if key in overrides:
+                        supplier[key] = overrides[key]
+                return supplier
     for s in cfg.get("suppliers", []):
         if model in await supplier_model_ids(s, cfg):
             return s
@@ -1432,6 +1480,34 @@ def sse_bytes(obj) -> bytes:
     return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n\n"
 
 
+def upstream_stream_failure_event(incoming_wire: str, model: str, message: str) -> bytes:
+    """Build a terminal SSE frame after an upstream stream breaks."""
+    message = str(message)[:500]
+    if incoming_wire == "responses":
+        return sse_bytes({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_" + uuid.uuid4().hex,
+                "object": "response",
+                "created_at": int(time.time()),
+                "status": "failed",
+                "model": model,
+                "output": [],
+                "error": {
+                    "code": "upstream_stream_error",
+                    "message": message,
+                },
+            },
+        })
+    return sse_bytes({
+        "error": {
+            "code": "upstream_stream_error",
+            "message": message,
+            "type": "upstream_stream_error",
+        }
+    })
+
+
 def _parse_sse_text(text: str):
     for line in text.splitlines():
         line = line.strip()
@@ -1490,6 +1566,7 @@ class UsageSniffer:
     def __init__(self):
         self.usage = None
         self.status = "ok"
+        self.saw_terminal = False
         self._buf = b""
 
     def feed(self, chunk: bytes) -> None:
@@ -1509,6 +1586,8 @@ class UsageSniffer:
             if not isinstance(obj, dict):
                 continue
             terminal_type = obj.get("type")
+            if terminal_type in ("response.completed", "response.failed", "response.incomplete"):
+                self.saw_terminal = True
             if terminal_type == "response.failed":
                 self.status = "failed"
             elif terminal_type == "response.incomplete":
@@ -2665,6 +2744,61 @@ def _reasoning_effort_value(body: dict):
     return None
 
 
+MODEL_OVERRIDE_KEYS = ("openai_sanitize", "forward_prompt_cache_key")
+
+
+REASONING_EFFORT_LEVELS = frozenset((
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+))
+
+
+def _configured_reasoning_effort(cfg: dict, model: str) -> str | None:
+    """Return the user-configured fallback effort for a mapped model."""
+    if not isinstance(cfg, dict):
+        return None
+    efforts = cfg.get("model_reasoning_efforts")
+    if not isinstance(efforts, dict):
+        return None
+    effort = efforts.get(model)
+    if not isinstance(effort, str):
+        return None
+    return effort.strip().lower() or None
+
+
+def _apply_configured_reasoning_effort(
+    body: dict,
+    cfg: dict,
+    model: str,
+    upstream_wire: str,
+    source_body: dict | None = None,
+) -> dict:
+    """Apply a configured effort only when the client omitted one entirely.
+
+    Codex Switch can downgrade a Responses request to Chat and omit
+    ``reasoning_effort``.  A model-specific fallback restores that level while
+    still preserving an explicit request (including an explicit empty value).
+    """
+    if not isinstance(body, dict):
+        return body
+    if isinstance(source_body, dict) and (
+        "reasoning" in source_body or "reasoning_effort" in source_body
+    ):
+        return body
+    if _reasoning_effort_value(body) is not None:
+        return body
+
+    effort = _configured_reasoning_effort(cfg, model)
+    if not effort:
+        return body
+
+    out = copy.deepcopy(body)
+    if upstream_wire == "chat":
+        out["reasoning_effort"] = effort
+    else:
+        out["reasoning"] = {"effort": effort}
+    return out
+
+
 def _is_xkiro_supplier(supplier: dict) -> bool:
     """Identify xKiro without changing behavior for other suppliers."""
     if not isinstance(supplier, dict):
@@ -2794,6 +2928,15 @@ async def relay(request: Request, incoming_wire: str):
         out_body = responses_to_chat(body, tool_bridge=tool_bridge)
     else:
         out_body = chat_to_responses(body)
+
+    if incoming_wire == "chat":
+        out_body = _apply_configured_reasoning_effort(
+            out_body,
+            cfg,
+            model,
+            upstream_wire,
+            source_body=body,
+        )
 
     if upstream_wire == "chat":
         out_body = _ensure_chat_stream_usage(out_body)
@@ -2992,7 +3135,25 @@ async def relay(request: Request, incoming_wire: str):
         except Exception as exc:
             rec["status"] = "error"
             rec["error"] = str(exc)[:300]
-            raise
+            # A broken upstream chunked body must not leave Codex with an
+            # abrupt transport error when a protocol-level terminal event can
+            # still be delivered. Do not transparently retry after output.
+            chunk = upstream_stream_failure_event(incoming_wire, model, str(exc))
+            sniffer.feed(chunk)
+            yield chunk
+            if incoming_wire == "chat":
+                yield b"data: [DONE]\n\n"
+        else:
+            if incoming_wire == "responses" and not sniffer.saw_terminal:
+                rec["status"] = "failed"
+                rec["error"] = "Upstream Responses stream ended without response.completed"
+                chunk = upstream_stream_failure_event(
+                    incoming_wire,
+                    model,
+                    rec["error"],
+                )
+                sniffer.feed(chunk)
+                yield chunk
         finally:
             u = sniffer.usage
             _update_record_usage(rec, u)
@@ -3164,6 +3325,38 @@ def validate_supplier(s: dict) -> str | None:
     return None
 
 
+def validate_model_reasoning_efforts(efforts) -> str | None:
+    if efforts is None:
+        return None
+    if not isinstance(efforts, dict):
+        return "model_reasoning_efforts 必须是对象"
+    for model, effort in efforts.items():
+        if not isinstance(model, str) or not model.strip():
+            return "model_reasoning_efforts 的模型名不能为空"
+        if not isinstance(effort, str) or effort.strip().lower() not in REASONING_EFFORT_LEVELS:
+            return f"模型 {model} 的默认思考强度无效"
+    return None
+
+
+def validate_model_overrides(overrides) -> str | None:
+    """Validate per-model request compatibility overrides."""
+    if overrides is None:
+        return None
+    if not isinstance(overrides, dict):
+        return "model_overrides 必须是对象"
+    for model, settings in overrides.items():
+        if not isinstance(model, str) or not model.strip():
+            return "model_overrides 的模型名不能为空"
+        if not isinstance(settings, dict):
+            return f"模型 {model} 的覆盖设置必须是对象"
+        for key, value in settings.items():
+            if key not in MODEL_OVERRIDE_KEYS:
+                return f"模型 {model} 的覆盖字段 {key} 无效"
+            if not isinstance(value, bool):
+                return f"模型 {model} 的覆盖字段 {key} 必须是布尔值"
+    return None
+
+
 @app.put("/api/config")
 async def api_put_config(request: Request):
     try:
@@ -3176,6 +3369,12 @@ async def api_put_config(request: Request):
         err = validate_supplier(s)
         if err:
             return JSONResponse(status_code=400, content={"error": err})
+    err = validate_model_reasoning_efforts(cfg.get("model_reasoning_efforts"))
+    if err:
+        return JSONResponse(status_code=400, content={"error": err})
+    err = validate_model_overrides(cfg.get("model_overrides"))
+    if err:
+        return JSONResponse(status_code=400, content={"error": err})
     if not isinstance(cfg.get("model_map", {}), dict):
         return JSONResponse(status_code=400, content={"error": "model_map 必须是对象"})
     try:
@@ -3248,6 +3447,11 @@ async def api_delete_supplier(name: str):
     cfg["suppliers"] = new_list
     mm = cfg.get("model_map", {})
     cfg["model_map"] = {k: v for k, v in mm.items() if v != name}
+    overrides = cfg.get("model_overrides")
+    if isinstance(overrides, dict):
+        cfg["model_overrides"] = {
+            k: v for k, v in overrides.items() if k in cfg.get("model_map", {})
+        }
     if cfg.get("default_supplier") == name:
         cfg["default_supplier"] = ""
     save_config(cfg)
@@ -3257,7 +3461,11 @@ async def api_delete_supplier(name: str):
 @app.get("/api/model_map")
 async def api_get_model_map():
     cfg = load_config()
-    return {"model_map": cfg.get("model_map", {}), "default_supplier": cfg.get("default_supplier", "")}
+    return {
+        "model_map": cfg.get("model_map", {}),
+        "model_overrides": cfg.get("model_overrides") or {},
+        "default_supplier": cfg.get("default_supplier", ""),
+    }
 
 
 @app.put("/api/model_map")
@@ -3274,24 +3482,56 @@ async def api_put_model_map(request: Request):
     for model, sup in mm.items():
         if sup not in names:
             return JSONResponse(status_code=400, content={"error": f"供应商 {sup} 不存在"})
+    overrides = data.get("model_overrides", cfg.get("model_overrides") or {})
+    err = validate_model_overrides(overrides)
+    if err:
+        return JSONResponse(status_code=400, content={"error": err})
     default = data.get("default_supplier", cfg.get("default_supplier", ""))
     if default and default not in names:
         return JSONResponse(status_code=400, content={"error": f"默认供应商 {default} 不存在"})
     cfg["model_map"] = mm
+    cleaned_overrides = {}
+    for model, settings in overrides.items():
+        if model not in mm:
+            continue
+        cleaned = {key: settings[key] for key in MODEL_OVERRIDE_KEYS if key in settings}
+        if cleaned:
+            cleaned_overrides[model] = cleaned
+    cfg["model_overrides"] = cleaned_overrides
     cfg["default_supplier"] = default or ""
     save_config(cfg)
     return {"ok": True}
 
 
-@app.delete("/api/model_map/{model}")
-async def api_delete_model_map(model: str):
+async def _delete_model_map_entry(model: str):
+    """Delete a model-map entry by its complete model ID."""
+    model = model.strip()
     cfg = load_config()
     mm = cfg.get("model_map", {})
     if model not in mm:
         return JSONResponse(status_code=404, content={"error": f"模型 {model} 不在 model_map 中"})
     del mm[model]
+    overrides = cfg.get("model_overrides")
+    if isinstance(overrides, dict):
+        overrides.pop(model, None)
     save_config(cfg)
     return {"ok": True}
+
+
+@app.delete("/api/model_map")
+async def api_delete_model_map(model: str):
+    """Delete a model-map entry supplied as a query parameter.
+
+    Model IDs commonly contain slashes (for example ``openai/gpt-5.6-sol``).
+    The query form keeps the complete ID intact for the dashboard.
+    """
+    return await _delete_model_map_entry(model)
+
+
+@app.delete("/api/model_map/{model:path}")
+async def api_delete_model_map_path(model: str):
+    """Backward-compatible path form for model IDs, including slashes."""
+    return await _delete_model_map_entry(model)
 
 
 @app.post("/api/models")
@@ -3519,12 +3759,23 @@ async def api_set_model_price(request: Request):
     return {"ok": True}
 
 
-@app.delete("/api/model-price/{model}")
-async def api_delete_model_price(model: str):
+async def _delete_model_price_entry(model: str):
     cfg = load_config()
     (cfg.setdefault("model_prices", {})).pop(model, None)
     save_config(cfg)
     return {"ok": True}
+
+
+@app.delete("/api/model-price")
+async def api_delete_model_price(model: str):
+    """Clear a model-specific price supplied as a query parameter."""
+    return await _delete_model_price_entry(model)
+
+
+@app.delete("/api/model-price/{model:path}")
+async def api_delete_model_price_path(model: str):
+    """Backward-compatible path form for model IDs, including slashes."""
+    return await _delete_model_price_entry(model)
 
 
 @app.post("/api/stats/clear")
@@ -3754,7 +4005,7 @@ async def api_restart_legacy():
 @app.get("/v1/models")
 async def get_models():
     cfg = load_config()
-    data = await merged_model_list(cfg)
+    data = configured_model_list(cfg)
     return {"object": "list", "data": data}
 
 

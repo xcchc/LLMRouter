@@ -32,6 +32,7 @@ Router 的目标是让 DeepSeek 和其他 Chat 协议模型在 Codex 中尽可�
 - Responses 的内嵌文件和音频没有通用的 Chat 等价格式，目前不能保证保真转换。Codex 读取本地文件时应优先使用客户端文件工具。
 - Chat 流没有原生 `phase`。Router 需要等到文本结束或出现工具调用后，才能可靠区分 commentary 与 final answer，因此首段文本的显示时机无法做到与原生 Responses 完全一致。
 - 上游在流式响应开始后中断时，Router 不能透明重试整次生成，否则可能产生重复文本或重复工具调用。
+- 上游流式响应中断或缺少 Responses 终止事件时，Router 会记录失败并尽量补发 `response.failed` / Chat 错误事件；已开始的输出仍不会自动重试。
 
 ## 手动启动
 
@@ -76,6 +77,7 @@ Copy-Item config.example.json config.json
 - `model_map`：模型名到供应商名的显式映射。
 - `default_supplier`：没有显式映射时使用的默认供应商。
 - `model_blacklist`：不在合并模型列表中展示的模型。
+- `model_reasoning_efforts`：按模型配置默认思考强度。仅当 Chat 请求完全没有携带思考强度时才会补充，不会覆盖客户端显式值。
 
 除监听端口外，配置会在请求时重新读取。修改端口后，请完全退出 Router，再手动启动。
 

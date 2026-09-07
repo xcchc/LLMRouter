@@ -40,6 +40,9 @@
       "image_handling": {}
     }
   ],
+  "model_reasoning_efforts": {
+    "gpt-example": "high"
+  },
   "model_map": {
     "gpt-example": "responses-provider",
     "deepseek-example": "chat-provider",
