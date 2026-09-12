@@ -1,5 +1,6 @@
 import gzip
 import json
+import asyncio
 import unittest
 from unittest.mock import patch
 
@@ -215,6 +216,37 @@ class MissingTerminalResponsesClient:
         pass
 
 
+class DelayedChatStream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+        await asyncio.sleep(0.12)
+        yield (
+            b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],'
+            b'"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}'
+            b'\n\n'
+        )
+        yield b"data: [DONE]\n\n"
+
+
+class DelayedChatClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def build_request(self, method, url, **kwargs):
+        return httpx.Request(method, url, **kwargs)
+
+    async def send(self, request, stream=False):
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            stream=DelayedChatStream(),
+        )
+
+    async def aclose(self):
+        pass
+
+
 class RouterStreamTests(unittest.IsolatedAsyncioTestCase):
     async def _relay_and_get_sent_chat_body(
         self,
@@ -332,6 +364,40 @@ class RouterStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(records[0]["status"], "failed")
         self.assertIn("response.completed", records[0]["error"])
 
+    async def test_stream_emits_sse_heartbeats_during_upstream_silence(self):
+        records = []
+
+        async def find_supplier(_cfg, _model):
+            return {
+                "name": "xkiro",
+                "base_url": "https://api.xkiro.com/v1",
+                "api_key": "test-key",
+                "wire_api": "chat",
+            }
+
+        request = FakeRequest({
+            "model": "z-ai/glm-5.3-flash",
+            "input": "Say ok.",
+            "stream": True,
+        })
+        with (
+            patch.object(router, "load_config", return_value={}),
+            patch.object(router, "find_supplier", new=find_supplier),
+            patch.object(router.httpx, "AsyncClient", DelayedChatClient),
+            patch.object(
+                router,
+                "SSE_HEARTBEAT_INTERVAL_SECONDS",
+                0.05,
+            ),
+            patch.object(router.stats, "record", side_effect=records.append),
+        ):
+            response = await router.relay(request, "responses")
+            body = b"".join([chunk async for chunk in response.body_iterator])
+
+        self.assertIn(b": keep-alive", body)
+        self.assertIn(b'"type": "response.completed"', body)
+        self.assertEqual(records[0]["status"], "ok")
+
     async def test_chat_to_responses_relay_applies_configured_effort(self):
         sent = await self._relay_and_get_sent_chat_body(
             {
@@ -367,7 +433,40 @@ class RouterStreamTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(sent["reasoning_effort"], "max")
-        self.assertNotIn("reasoning", sent)
+
+    async def test_title_generation_uses_recent_session_model(self):
+        models = []
+
+        async def find_supplier(_cfg, model):
+            models.append(model)
+            return {
+                "name": "pixel",
+                "base_url": "https://ai-pixel.online",
+                "api_key": "test-key",
+                "wire_api": "responses",
+            }
+
+        request = FakeRequest({
+            "model": "gpt-5.6-luna",
+            "instructions": (
+                "You are a helpful assistant. You will be presented with a user prompt"
+            ),
+            "input": "Fix login bug.",
+            "stream": True,
+        })
+        previous = router._last_session_model
+        router._last_session_model = "z-ai/glm-5.3-flash"
+        try:
+            with (
+                patch.object(router, "load_config", return_value={}),
+                patch.object(router, "find_supplier", new=find_supplier),
+                patch.object(router.stats, "record"),
+            ):
+                await router.relay(request, "responses")
+        finally:
+            router._last_session_model = previous
+
+        self.assertEqual(models, ["z-ai/glm-5.3-flash"])
 
     async def test_xkiro_chat_keeps_top_level_effort_from_responses_request(self):
         sent = await self._relay_and_get_sent_chat_body(

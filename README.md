@@ -92,6 +92,15 @@ Copy-Item config.example.json config.json
 
 切换模型时，Router 根据 `model_map`、供应商模型列表和 `default_supplier` 选择上游。
 
+### Codex Switch 模型元数据
+
+要让 Codex Desktop 的 UI 显示原生思维摘要和文件变更卡片，Codex Switch 侧的第三方模型元数据需要与协议能力一致：
+
+- `apply_patch_tool_type` 设为 `"freeform"`。否则 Codex 不会声明 `apply_patch` freeform 工具，第三方模型只能把补丁包进 `exec_command`，UI 会显示为命令执行而不是 `FileChange`。
+- `default_reasoning_summary` 设为 `"auto"`。`none` 会明确要求上游不返回摘要；`supports_reasoning_summaries` 仍需保持 `true`。
+
+Router 会把 Codex 的 `custom_tool_call`（如 `apply_patch`）桥接为 Chat function call，并在响应流中恢复成 Responses `custom_tool_call`；但如果客户端没有声明该工具，Router 不能安全地替客户端伪造工具调用。
+
 生图技能也走同一个入口：在 `suppliers` 中添加图片供应商，并把 `gpt-image-2` 映射到该供应商。技能调用 `http://127.0.0.1:8765/v1/images/generations` 或 `/v1/images/edits`，Router 读取供应商配置并转发，技能不需要知道上游地址或密钥。
 
 ## 更新

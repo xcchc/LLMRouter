@@ -13,6 +13,7 @@ import asyncio
 import copy
 import json
 import hashlib
+import logging
 import os
 import re
 import subprocess
@@ -21,6 +22,7 @@ import tempfile
 import threading
 import time
 import uuid
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import httpx
@@ -47,10 +49,62 @@ DASHBOARD_PATH = _DATA_DIR / "dashboard.html"
 MODEL_CACHE_TTL = 600  # 上游模型列表缓存秒数
 APP_VERSION = "2026.09.05.1"
 
+ERROR_LOG_PATH = BASE_DIR / "router-error.log"
+_error_logger = logging.getLogger("llm_router")
+_error_logger.setLevel(logging.ERROR)
+if not _error_logger.handlers:
+    _error_handler = RotatingFileHandler(
+        ERROR_LOG_PATH,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=2,
+        encoding="utf-8",
+    )
+    _error_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    )
+    _error_logger.addHandler(_error_handler)
+
 app = FastAPI(title="LLM Router", docs_url=None, redoc_url=None)
 
-DONE = object()  # SSE [DONE] 哨兵
 
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """记录 FastAPI 未处理异常，避免只看到 500 却没有原因。"""
+    try:
+        _error_logger.exception(
+            "Unhandled error on %s %s (content_length=%s)",
+            request.method,
+            request.url.path,
+            request.headers.get("content-length"),
+            exc_info=exc,
+        )
+    except Exception:
+        pass
+    return Response(
+        content="Internal Server Error",
+        status_code=500,
+        media_type="text/plain",
+    )
+
+DONE = object()  # SSE [DONE] 哨兵
+SSE_HEARTBEAT = object()
+SSE_HEARTBEAT_INTERVAL_SECONDS = 15.0
+
+_TITLE_INSTRUCTION_PREFIXES = (
+    "You are a helpful assistant. You will be presented with a user prompt",
+    "You are a helpful assistant. You will be presented with the most recent messages",
+)
+_last_session_model: str | None = None
+
+
+def _is_title_generation_body(body: dict) -> bool:
+    """Codex 新任务标题生成使用独立的 helper 模型，可按 prompt 特征识别。"""
+    if not isinstance(body, dict):
+        return False
+    instructions = body.get("instructions")
+    return isinstance(instructions, str) and instructions.startswith(
+        _TITLE_INSTRUCTION_PREFIXES
+    )
 
 def _upstream_models_url(base_url: str) -> str:
     """拼接上游 /models 地址；非 ASCII 字符（如中文）做百分号编码，避免请求崩溃。"""
@@ -1508,6 +1562,49 @@ def upstream_stream_failure_event(incoming_wire: str, model: str, message: str) 
     })
 
 
+async def _with_sse_heartbeats(source, interval: float | None = None):
+    """Yield source items and emit an SSE comment while the upstream is silent.
+
+    Some chat upstreams stay quiet for minutes during long reasoning.  Local
+    proxies such as Codex Switch treat that as an idle stream and close the
+    connection before ``response.completed``.  SSE comments are ignored by
+    clients but reset their idle timer.
+    """
+    interval = SSE_HEARTBEAT_INTERVAL_SECONDS if interval is None else interval
+    queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+
+    async def pump():
+        try:
+            async for item in source:
+                await queue.put(item)
+            await queue.put(None)
+        except Exception as exc:
+            await queue.put(exc)
+
+    pump_task = asyncio.create_task(pump())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                yield SSE_HEARTBEAT
+                continue
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        if not pump_task.done():
+            pump_task.cancel()
+        try:
+            await pump_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+
 def _parse_sse_text(text: str):
     for line in text.splitlines():
         line = line.strip()
@@ -2893,12 +2990,18 @@ def _update_record_usage(rec: dict, usage) -> None:
 
 
 async def relay(request: Request, incoming_wire: str):
+    global _last_session_model
     cfg = load_config()
     try:
         body = await request.json()
     except Exception:
         body = {}
     model = (body or {}).get("model", "")
+    is_title_generation = _is_title_generation_body(body)
+    if not is_title_generation and isinstance(model, str) and model:
+        _last_session_model = model
+    elif is_title_generation and _last_session_model and model != _last_session_model:
+        model = _last_session_model
     supplier = await find_supplier(cfg, model)
     if not supplier:
         return JSONResponse(
@@ -3116,19 +3219,29 @@ async def relay(request: Request, incoming_wire: str):
     async def gen():
         try:
             if incoming_wire == upstream_wire:
-                async for chunk in resp.aiter_bytes():
+                async for item in _with_sse_heartbeats(resp.aiter_bytes()):
+                    if item is SSE_HEARTBEAT:
+                        chunk = b": keep-alive\n\n"
+                    else:
+                        chunk = item
                     sniffer.feed(chunk)
                     yield chunk
             elif incoming_wire == "responses":
                 conv = ChatToResponses(model, tool_bridge=tool_bridge)
-                async for evt in conv.convert(resp):
-                    chunk = sse_bytes(evt)
+                async for evt in _with_sse_heartbeats(conv.convert(resp)):
+                    if evt is SSE_HEARTBEAT:
+                        chunk = b": keep-alive\n\n"
+                    else:
+                        chunk = sse_bytes(evt)
                     sniffer.feed(chunk)
                     yield chunk
             else:
                 conv = ResponsesToChat(model)
-                async for evt in conv.convert(resp):
-                    chunk = sse_bytes(evt)
+                async for evt in _with_sse_heartbeats(conv.convert(resp)):
+                    if evt is SSE_HEARTBEAT:
+                        chunk = b": keep-alive\n\n"
+                    else:
+                        chunk = sse_bytes(evt)
                     sniffer.feed(chunk)
                     yield chunk
                 yield b"data: [DONE]\n\n"
