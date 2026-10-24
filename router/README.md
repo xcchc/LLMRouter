@@ -52,6 +52,65 @@ Router 不注册 Windows 开机自启动，进程退出后也不会自动拉起�
 
 如果从 Releases 下载了 `LLMRouter.exe`，双击该文件即可手动启动。运行数据会保存在 EXE 同目录。仓库本身不依赖 `dist\LLMRouter.exe`，构建产物不应提交到源码仓库。
 
+## macOS 版
+
+Releases 里提供两个 macOS 包，按自己的芯片选一个：
+
+| 文件 | 适用机型 |
+| --- | --- |
+| `LLMRouter-macos-arm64.zip` | Apple Silicon（M1/M2/M3/M4…） |
+| `LLMRouter-macos-x64.zip` | Intel 芯片 |
+
+不确定的话，点左上角  →「关于本机」，看「芯片」一栏写的是 Apple M 系列还是 Intel。
+
+### 安装
+
+1. 下载对应架构的 zip，双击解压得到 `LLMRouter.app`。
+2. 把 `LLMRouter.app` 拖到「应用程序」文件夹（也可以直接放在任意目录，但放进 `/Applications` 最省事）。
+3. 首次打开请**右键点图标 →「打开」**，在弹窗里再点一次「打开」。
+
+如果提示「无法打开，因为 Apple 无法验证」，在终端执行一次：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/LLMRouter.app
+```
+
+这个包没有做 Apple 开发者签名和公证（需要付费账号），所以每次重新下载都要走一次上面的放行步骤。程序本身只监听 `127.0.0.1`，不对外开端口。
+
+### 数据存在哪
+
+macOS 版把配置和统计放在用户目录，而不是 `.app` 里面——`.app` 通常在 `/Applications`，普通用户没有写权限，而且往 bundle 里写文件会破坏代码签名：
+
+```
+~/Library/Application Support/LLMRouter/
+├── config.json     # 供应商、API Key、端口等
+├── stats.jsonl     # 请求统计
+├── router-error.log
+└── crash.log
+```
+
+想备份或迁移，复制这个目录即可。Windows 版仍然是 exe 同目录（绿色免安装，整个文件夹可以随便挪）。
+
+### 更新
+
+macOS 版**不支持**在界面里点「更新并重启」自动替换程序（macOS 上替换正在运行的 `.app` 不可靠）。有新版本时重新下载 zip，解压后把新的 `LLMRouter.app` 拖到 `/Applications` 覆盖即可，`~/Library/Application Support/LLMRouter` 里的数据不受影响。
+
+### 自己构建
+
+`.app` 只能在 macOS 上打包（PyInstaller 不支持交叉编译），Windows 上没法出 mac 包。
+
+本地构建：
+
+```bash
+cd router
+./build-macos.sh          # 产出 dist/LLMRouter.app
+./build-macos.sh --zip    # 顺便打出 LLMRouter-macos-<arch>.zip
+```
+
+脚本会建虚拟环境、装依赖、跑单元测试、打包，然后用无界面模式启动一次打包产物并请求 `/api/health`，确认真的能跑起来。
+
+不装 macOS 也可以：仓库自带 GitHub Actions 工作流（`.github/workflows/build-macos.yml`），在 Actions 页面点「Run workflow」就会同时构建 Apple Silicon 和 Intel 两个包，产物在对应 run 的 Artifacts 里下载。
+
 ## 首次配置
 
 首次启动会自动创建空的 `config.json`。也可以在启动前复制公开模板：
@@ -192,4 +251,18 @@ Router 不会把供应商的 `api_key` 返回给 Skill，也不会要求 Skill �
 
 **启动后立即退出**
 
-检查同目录 `crash.log`。源码版还可以在终端运行 `start.bat` 查看错误信息。
+Windows 版检查同目录 `crash.log`；macOS 版检查 `~/Library/Application Support/LLMRouter/crash.log`。源码版还可以在终端运行 `start.bat`（Windows）或 `python app.py`（macOS）查看错误信息。
+
+**macOS 上双击没反应 / 一闪而过**
+
+先确认下载的架构和机器对得上（Apple Silicon 用 `arm64` 包，Intel 用 `x64` 包）。然后在终端直接运行打包后的可执行文件，报错会打印在终端里：
+
+```bash
+/Applications/LLMRouter.app/Contents/MacOS/LLMRouter
+```
+
+**macOS 上托盘图标不见了**
+
+菜单栏图标太多时会被系统隐藏（尤其带刘海的机型）。实在找不到，先在「活动监视器」里结束 `LLMRouter` 进程，再重新打开 `LLMRouter.app`。
+
+注意：网关没退出时重新打开程序会提示端口被占用，这是正常的——说明它还在后台跑。

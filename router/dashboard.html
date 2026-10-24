@@ -919,17 +919,27 @@ async function loadUpdateStatus(){
     const status = $('#updateStatus');
     const btn = $('#btnApplyUpdate');
     if(!st.frozen){
-      status.textContent = '源码模式：请使用 apply-update.bat 手动更新';
+      status.textContent = st.platform === 'macos'
+        ? '源码模式：请用 build-macos.sh 重新打包后替换 LLMRouter.app'
+        : '源码模式：请使用 apply-update.bat 手动更新';
       btn.disabled = true;
       return;
     }
+    if(!st.self_update){
+      // macOS：.app 里的可执行文件不能像 Windows 那样自己替换自己，走 zip 覆盖安装
+      status.textContent = `版本 ${st.version}：macOS 版请下载新版 LLMRouter-macos-*.zip，解压后把 LLMRouter.app 拖到 /Applications 覆盖`;
+      btn.disabled = true;
+      btn.textContent = '需手动覆盖安装';
+      return;
+    }
+    btn.textContent = '更新并重启';
     if(st.new_exe.exists){
       const size = (st.new_exe.size / 1024 / 1024).toFixed(1) + ' MB';
       const time = new Date(st.new_exe.mtime * 1000).toLocaleString('zh-CN', {hour12:false});
-      status.textContent = `版本 ${st.version}：发现新版 LLMRouter.new.exe（${size}，${time}，SHA256 ${st.new_exe.sha256.slice(0, 8)}...）`;
+      status.textContent = `版本 ${st.version}：发现新版 ${st.new_exe_name}（${size}，${time}，SHA256 ${st.new_exe.sha256.slice(0, 8)}...）`;
       btn.disabled = false;
     }else{
-      status.textContent = `版本 ${st.version}：未发现 LLMRouter.new.exe，请先构建并放置到同目录`;
+      status.textContent = `版本 ${st.version}：未发现 ${st.new_exe_name}，请先构建并放置到同目录`;
       btn.disabled = true;
     }
   }catch(e){
@@ -938,7 +948,9 @@ async function loadUpdateStatus(){
   }
 }
 async function applyUpdate(){
-  if(!confirm('将替换 LLMRouter.exe 并自动重启，当前会话可能短暂断开，是否继续？')) return;
+  const st = await api('/api/update/status').catch(() => null);
+  const exeName = (st && st.exe_name) || 'LLMRouter.exe';
+  if(!confirm(`将替换 ${exeName} 并自动重启，当前会话可能短暂断开，是否继续？`)) return;
   const btn = $('#btnApplyUpdate');
   const status = $('#updateStatus');
   btn.disabled = true;

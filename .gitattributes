@@ -1,0 +1,15 @@
+# Shell 脚本必须是 LF，否则在 macOS / Linux 上会报
+# "bad interpreter: /usr/bin/env bash^M"
+*.sh text eol=lf
+
+# Windows 批处理必须是 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制资源，不要做换行符转换
+*.ico binary
+*.icns binary
+*.png binary
+*.exe binary
+*.zip binary

@@ -21,11 +21,14 @@ try:
 except Exception:
     pystray = None
 
-if getattr(sys, "frozen", False):
-    BASE_DIR = Path(sys.executable).resolve().parent  # exe 所在目录（crash.log 放这里）
-else:
-    BASE_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = BASE_DIR / "config.json"
+import paths as _paths
+
+BASE_DIR = _paths.BASE_DIR        # 程序所在目录
+DATA_DIR = _paths.DATA_DIR        # 用户数据目录（macOS 在 ~/Library/Application Support）
+CONFIG_PATH = _paths.CONFIG_PATH
+CRASH_LOG_PATH = _paths.CRASH_LOG_PATH
+
+IS_MACOS = _paths.IS_MACOS
 
 _tray_icon = None    # pystray.Icon 实例
 _tray_ready = False  # 托盘是否启动成功
@@ -51,11 +54,14 @@ class AppApi:
 
 def _load_tray_image():
     """加载托盘图标；失败时生成占位图。"""
-    candidates = []
+    # macOS 打包后图标在 Contents/Resources，Windows 在 exe 同目录，统一用 resource_path 找
+    candidates = [_paths.resource_path("icon.icns"), _paths.resource_path("icon.ico")]
     if getattr(sys, "frozen", False):
         meipass = Path(getattr(sys, "_MEIPASS", ""))
         if meipass.exists():
+            candidates.append(meipass / "icon.icns")
             candidates.append(meipass / "icon.ico")
+    candidates.append(BASE_DIR / "icon.icns")
     candidates.append(BASE_DIR / "icon.ico")
     for path in candidates:
         try:
@@ -77,11 +83,19 @@ def start_tray(window, show_cb, quit_cb):
             pystray.MenuItem("显示主界面", lambda icon, item: show_cb(), default=True),
             pystray.MenuItem("退出软件", lambda icon, item: quit_cb()),
         )
+        kwargs = {}
+        if IS_MACOS:
+            # macOS 的托盘图标是状态栏图标，必须绑定到已存在的 NSApplication，
+            # 并且要在主线程、NSApp 跑起来之后再创建。
+            import AppKit
+
+            kwargs["darwin_nsapplication"] = AppKit.NSApplication.sharedApplication()
         _tray_icon = pystray.Icon(
             "llm-router",
             _load_tray_image(),
             "LLM Router 控制台",
             menu,
+            **kwargs,
         )
         _tray_icon.run_detached()
         _tray_icon.update_menu()  # 预创建原生菜单，避免首次右键无响应
@@ -116,6 +130,25 @@ if sys.stdout is None or sys.stderr is None:
 def _show_error(title: str, text: str) -> None:
     """EXE 用 --windowed 打包、没有控制台，print 出来的话用户只会看到闪退。"""
     try:
+        if IS_MACOS:
+            # macOS 没有 MessageBoxW，用 osascript 弹系统原生对话框（不依赖 GUI 库）。
+            import subprocess
+
+            def _q(value: str) -> str:
+                return value.replace("\\", "\\\\").replace('"', '\\"')
+
+            script = (
+                f'display alert "{_q(title)}" message "{_q(text)}" '
+                'as critical buttons {"好"} default button "好"'
+            )
+            subprocess.run(
+                ["osascript", "-e", script],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return
         import ctypes
 
         ctypes.windll.user32.MessageBoxW(None, text, title, 0x10)  # MB_ICONERROR
@@ -169,8 +202,77 @@ def start_server(port: int):
     return None, None
 
 
+def _headless_requested() -> bool:
+    """CI / 无图形环境用：只跑网关，不开窗口和托盘。"""
+    return os.environ.get("LLMROUTER_HEADLESS", "").strip().lower() in ("1", "true", "yes")
+
+
+def _selftest_requested() -> bool:
+    """打包自检用：只验证依赖能不能 import，不启动网关。"""
+    return os.environ.get("LLMROUTER_SELFTEST", "").strip().lower() in ("1", "true", "yes")
+
+
+# 打包后最容易缺的就是这些：PyInstaller 没有 pyobjc / pystray 的现成 hook，
+# 全靠 LLMRouter.spec 里的 hiddenimports 手动声明，写漏了要到用户机器上才炸。
+_SELFTEST_COMMON = (
+    "webview",
+    "pystray",
+    "PIL.Image",
+)
+
+_SELFTEST_MACOS = (
+    "webview.platforms.cocoa",
+    "AppKit",
+    "Foundation",
+    "WebKit",
+    "objc",
+    "PyObjCTools.AppHelper",
+    "Quartz",
+    "UniformTypeIdentifiers",
+)
+
+_SELFTEST_WINDOWS = (
+    "webview.platforms.winforms",
+    "clr",
+)
+
+
+def _selftest_modules():
+    if IS_MACOS:
+        return _SELFTEST_COMMON + _SELFTEST_MACOS
+    if _paths.IS_WINDOWS:
+        return _SELFTEST_COMMON + _SELFTEST_WINDOWS
+    return _SELFTEST_COMMON
+
+
+def _run_selftest() -> int:
+    """逐个 import 关键依赖；缺哪个就报哪个。返回进程退出码。"""
+    import importlib
+
+    modules = _selftest_modules()
+    failed = []
+    for name in modules:
+        try:
+            importlib.import_module(name)
+        except Exception as exc:
+            failed.append(name)
+            print(f"SELFTEST FAIL {name}: {type(exc).__name__}: {exc}")
+        else:
+            print(f"SELFTEST OK {name}")
+
+    print(f"SELFTEST RESULT {len(modules) - len(failed)}/{len(modules)}")
+    if failed:
+        print("SELFTEST FAILED")
+        return 1
+    print("SELFTEST PASSED")
+    return 0
+
+
 def main():
     import router
+
+    if _selftest_requested():
+        sys.exit(_run_selftest())
 
     router.migrate_config_on_startup()
     cfg = load_config()
@@ -192,7 +294,7 @@ def main():
         _show_error(
             "LLM Router 启动失败",
             f"端口 {port} 可能已被占用。\n\n"
-            "请关闭占用该端口的程序，或修改同目录 config.json 里的 port 后重试。",
+            f"请关闭占用该端口的程序，或修改 {CONFIG_PATH} 里的 port 后重试。",
         )
         print(f"启动失败：端口 {port} 可能已被占用。请关闭占用该端口的程序，或改端口后重试。")
         sys.exit(1)
@@ -200,6 +302,16 @@ def main():
     url = f"http://127.0.0.1:{port}/"
     print(f"LLM Router 控制台：{url}")
     print("关闭窗口将隐藏到系统托盘（右下角小图标）；点托盘“显示主界面”恢复，托盘菜单“退出软件”可退出。")
+
+    if _headless_requested():
+        print("无界面模式：网关已启动，按 Ctrl+C 退出。")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+        server.should_exit = True
+        return
 
     if cfg.get("open_browser"):
         # 浏览器模式（设置里勾选了"浏览器模式"时）
@@ -255,6 +367,10 @@ def main():
                 except Exception:
                     os._exit(0)
 
+            # 托盘必须在进入 GUI 主循环之前建好：pystray 的 run_detached()
+            # 要求先调用它、再由别的库（pywebview）接管主循环。
+            # macOS 上 pywebview 自己会把 NSApplication 设成 Regular 策略
+            # （有 Dock 图标、有应用菜单、⌘Q 可用），这里不用再改。
             start_tray(window, _show_window, _quit_from_tray)
             webview.start()
         except Exception as exc:
@@ -274,7 +390,7 @@ def _write_crash_log():
     """把异常堆栈写入 crash.log，方便双击闪退时排查。"""
     try:
         import traceback
-        with open(BASE_DIR / "crash.log", "a", encoding="utf-8") as f:
+        with open(CRASH_LOG_PATH, "a", encoding="utf-8") as f:
             f.write("=" * 60 + "\n")
             f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
             traceback.print_exc(file=f)
@@ -289,5 +405,5 @@ if __name__ == "__main__":
         raise
     except Exception:
         _write_crash_log()
-        print("程序异常退出，详情已写入 crash.log")
+        print(f"程序异常退出，详情已写入 {CRASH_LOG_PATH}")
         raise

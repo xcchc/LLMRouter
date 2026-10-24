@@ -1,0 +1,156 @@
+name: Build macOS app
+
+# macOS 的 .app 只能在 macOS 上打包（PyInstaller 不能交叉编译），
+# 所以 Windows 上开发、由 GitHub Actions 出 Apple Silicon / Intel 两个包。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'router/**'
+      - '.github/workflows/build-macos.yml'
+  pull_request:
+    paths:
+      - 'router/**'
+      - '.github/workflows/build-macos.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-15      = Apple Silicon (arm64)
+          # macos-15-intel = Intel (x64)
+          - os: macos-15
+            arch: arm64
+            label: macOS arm64 (Apple Silicon)
+          - os: macos-15-intel
+            arch: x64
+            label: macOS x64 (Intel)
+    defaults:
+      run:
+        working-directory: router
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Show environment
+        run: |
+          set -euo pipefail
+          uname -a
+          sw_vers
+          python -VV
+          python -c 'import platform, sys; print("machine:", platform.machine(), "platform:", sys.platform)'
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build .app bundle
+        run: python -m PyInstaller --noconfirm --clean LLMRouter.spec
+
+      - name: Verify bundle layout
+        run: |
+          set -euo pipefail
+          APP=dist/LLMRouter.app
+          test -d "$APP" || { echo "::error::没有生成 $APP"; exit 1; }
+          test -x "$APP/Contents/MacOS/LLMRouter" || { echo "::error::缺少可执行文件"; exit 1; }
+          test -f "$APP/Contents/Info.plist" || { echo "::error::缺少 Info.plist"; exit 1; }
+          # 这两个是运行时真正要用的资源：界面 + 托盘/程序图标
+          test -f "$APP/Contents/Resources/dashboard.html" || { echo "::error::缺少 dashboard.html"; exit 1; }
+          test -f "$APP/Contents/Resources/icon.icns" || { echo "::error::缺少 icon.icns"; exit 1; }
+
+          echo "--- Info.plist ---"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist"
+
+          echo "--- 架构 ---"
+          lipo -archs "$APP/Contents/MacOS/LLMRouter"
+
+          echo "--- 代码签名（PyInstaller 只做 ad-hoc 签名）---"
+          codesign -dv "$APP" 2>&1 || true
+
+          echo "--- 大小 ---"
+          du -sh "$APP"
+
+      - name: Self-test bundled dependencies
+        run: |
+          set -euo pipefail
+          # headless 冒烟测试不会 import AppKit/webview，缺 pyobjc 也照样过。
+          # 这里单独把打包后的关键依赖全部 import 一遍，缺一个就失败。
+          LLMROUTER_SELFTEST=1 ./dist/LLMRouter.app/Contents/MacOS/LLMRouter
+
+      - name: Smoke test (headless)
+        run: |
+          set -euo pipefail
+          # runner 上没有窗口服务，用无界面模式只验网关能不能起来
+          LOG="$RUNNER_TEMP/llmrouter-smoke.log"
+          LLMROUTER_HEADLESS=1 ./dist/LLMRouter.app/Contents/MacOS/LLMRouter >"$LOG" 2>&1 &
+          APP_PID=$!
+          cleanup() { kill "$APP_PID" 2>/dev/null || true; }
+          trap cleanup EXIT
+
+          ok=0
+          for _ in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:8765/api/health" >/dev/null 2>&1; then
+              ok=1
+              break
+            fi
+            if ! kill -0 "$APP_PID" 2>/dev/null; then
+              echo "程序启动后立刻退出了"
+              break
+            fi
+            sleep 0.5
+          done
+
+          echo "--- 程序输出 ---"
+          cat "$LOG" || true
+
+          if [ "$ok" != "1" ]; then
+            echo "::error::打包后的程序没能启动网关"
+            exit 1
+          fi
+          echo "--- /api/health ---"
+          curl -fsS "http://127.0.0.1:8765/api/health"
+          echo
+          cleanup
+          trap - EXIT
+
+      - name: Zip .app
+        id: zip
+        run: |
+          set -euo pipefail
+          ZIP="LLMRouter-macos-${{ matrix.arch }}.zip"
+          rm -f "$ZIP"
+          # 必须用 ditto：zip 命令会丢掉符号链接和可执行权限，解压后 .app 直接坏掉
+          ditto -c -k --sequesterRsrc --keepParent dist/LLMRouter.app "$ZIP"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          ls -lh "$ZIP"
+          shasum -a 256 "$ZIP"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LLMRouter-macos-${{ matrix.arch }}
+          path: router/${{ steps.zip.outputs.zip }}
+          if-no-files-found: error
+          retention-days: 30

@@ -3,15 +3,12 @@
 import datetime
 import json
 import re
-import sys
 import threading
-from pathlib import Path
 
-if getattr(sys, "frozen", False):
-    BASE_DIR = Path(sys.executable).resolve().parent  # exe 所在目录
-else:
-    BASE_DIR = Path(__file__).resolve().parent
-STATS_FILE = BASE_DIR / "stats.jsonl"
+import paths as _paths
+
+BASE_DIR = _paths.BASE_DIR   # 程序所在目录
+STATS_FILE = _paths.STATS_FILE
 MAX_LINES = 100000   # 文件超过该行数时裁剪
 KEEP_LINES = 50000   # 裁剪后保留的行数
 

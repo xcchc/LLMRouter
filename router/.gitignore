@@ -42,6 +42,8 @@ __pycache__/
 /build/
 /dist/
 /LLMRouter*.exe
+/LLMRouter.app/
+/LLMRouter*.zip
 *.egg-info/
 
 # Local verification and backup directories

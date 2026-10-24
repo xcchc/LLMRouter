@@ -66,18 +66,16 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-if getattr(sys, "frozen", False):
-    BASE_DIR = Path(sys.executable).resolve().parent          # exe 所在目录（config/stats 放这里）
-    _DATA_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR))      # 打包资源目录
-else:
-    BASE_DIR = Path(__file__).resolve().parent
-    _DATA_DIR = BASE_DIR
-CONFIG_PATH = BASE_DIR / "config.json"
-DASHBOARD_PATH = _DATA_DIR / "dashboard.html"
-MODEL_CACHE_TTL = 600  # 上游模型列表缓存秒数
-APP_VERSION = "2026.10.24.1"
+import paths as _paths
 
-ERROR_LOG_PATH = BASE_DIR / "router-error.log"
+BASE_DIR = _paths.BASE_DIR                 # 程序所在目录（Windows 版 config/stats 放这里）
+DATA_DIR = _paths.DATA_DIR                 # 用户数据目录（macOS 在 ~/Library/Application Support）
+CONFIG_PATH = _paths.CONFIG_PATH
+DASHBOARD_PATH = _paths.DASHBOARD_PATH
+MODEL_CACHE_TTL = 600  # 上游模型列表缓存秒数
+APP_VERSION = _paths.APP_VERSION
+
+ERROR_LOG_PATH = _paths.ERROR_LOG_PATH
 _error_logger = logging.getLogger("llm_router")
 _error_logger.setLevel(logging.ERROR)
 if not _error_logger.handlers:
@@ -3998,8 +3996,12 @@ def _update_file_status(base_dir: Path) -> dict:
         "ok": True,
         "frozen": bool(getattr(sys, "frozen", False)),
         "version": APP_VERSION,
-        "current_exe": _exe_file_info(base_dir / "LLMRouter.exe"),
-        "new_exe": _exe_file_info(base_dir / "LLMRouter.new.exe"),
+        "platform": "windows" if _paths.IS_WINDOWS else ("macos" if _paths.IS_MACOS else sys.platform),
+        "self_update": _paths.SELF_UPDATE_SUPPORTED,
+        "exe_name": _paths.EXE_NAME,
+        "new_exe_name": _paths.NEW_EXE_NAME,
+        "current_exe": _exe_file_info(base_dir / _paths.EXE_NAME),
+        "new_exe": _exe_file_info(base_dir / _paths.NEW_EXE_NAME),
     }
 
 
@@ -4012,11 +4014,12 @@ def _build_update_script(
 ) -> str:
     """Build the PowerShell updater; wait/launch flags exist for unit tests."""
     dir_literal = str(base_dir.resolve()).replace("'", "''")
+    proc_name = _paths.APP_NAME.replace("'", "''")
     wait_block = (
         "$deadline = (Get-Date).AddSeconds(90)\n"
-        "while (Get-Process -Name 'LLMRouter' -ErrorAction SilentlyContinue) {\n"
+        f"while (Get-Process -Name '{proc_name}' -ErrorAction SilentlyContinue) {{\n"
         "    if ((Get-Date) -ge $deadline) {\n"
-        "        Get-Process -Name 'LLMRouter' -ErrorAction SilentlyContinue | Stop-Process -Force\n"
+        f"        Get-Process -Name '{proc_name}' -ErrorAction SilentlyContinue | Stop-Process -Force\n"
         "        break\n"
         "    }\n"
         "    Start-Sleep -Milliseconds 500\n"
@@ -4029,14 +4032,17 @@ def _build_update_script(
         "    }\n"
     ) if force_fail else ""
     launch_call = "Start-Router" if launch_new else "# launch disabled for test"
+    exe_name = _paths.EXE_NAME
+    prev_name = _paths.PREV_EXE_NAME
+    new_name = _paths.NEW_EXE_NAME
     return f"""$ErrorActionPreference = 'Stop'
 $dir = '{dir_literal}'
 Set-Location -LiteralPath $dir
 
 {wait_block}
-$old = Join-Path $dir 'LLMRouter.exe'
-$prev = Join-Path $dir 'LLMRouter.previous.exe'
-$new = Join-Path $dir 'LLMRouter.new.exe'
+$old = Join-Path $dir '{exe_name}'
+$prev = Join-Path $dir '{prev_name}'
+$new = Join-Path $dir '{new_name}'
 Remove-Item -LiteralPath $prev -Force -ErrorAction SilentlyContinue
 
 function Start-Router {{
@@ -4059,7 +4065,7 @@ function Get-Sha256([string] $path) {{
 
 try {{
     if (-not (Test-Path -LiteralPath $new)) {{
-        throw 'LLMRouter.new.exe not found'
+        throw '{new_name} not found'
     }}
     $moved = $false
     for ($i = 0; $i -lt 20; $i++) {{
@@ -4082,7 +4088,7 @@ try {{
     }}
     Remove-Item -LiteralPath $new -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $prev -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path $dir 'crash.log') -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $dir '{_paths.CRASH_LOG_PATH.name}') -Force -ErrorAction SilentlyContinue
     {launch_call}
 }} catch {{
     Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
@@ -4105,11 +4111,19 @@ async def api_update_status():
 
 @app.post("/api/update/apply")
 async def api_update_apply():
+    if not _paths.SELF_UPDATE_SUPPORTED:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "macOS 版不支持在线替换程序：请下载新的 LLMRouter-macos-*.zip，"
+                "解压后把 LLMRouter.app 拖到 /Applications 覆盖旧版本",
+            },
+        )
     if not getattr(sys, "frozen", False):
         return JSONResponse(status_code=400, content={"error": "源码模式无法自动更新 EXE，请使用 apply-update.bat"})
-    new_exe = BASE_DIR / "LLMRouter.new.exe"
+    new_exe = BASE_DIR / _paths.NEW_EXE_NAME
     if not new_exe.exists():
-        return JSONResponse(status_code=400, content={"error": "未找到 LLMRouter.new.exe"})
+        return JSONResponse(status_code=400, content={"error": f"未找到 {_paths.NEW_EXE_NAME}"})
 
     script = _build_update_script(BASE_DIR)
     fd, script_path = tempfile.mkstemp(prefix="llmrouter-update-", suffix=".ps1")
