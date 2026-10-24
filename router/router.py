@@ -75,7 +75,7 @@ else:
 CONFIG_PATH = BASE_DIR / "config.json"
 DASHBOARD_PATH = _DATA_DIR / "dashboard.html"
 MODEL_CACHE_TTL = 600  # 上游模型列表缓存秒数
-APP_VERSION = "2026.09.05.1"
+APP_VERSION = "2026.10.24.1"
 
 ERROR_LOG_PATH = BASE_DIR / "router-error.log"
 _error_logger = logging.getLogger("llm_router")
@@ -194,9 +194,13 @@ def _ensure_config() -> None:
 
 
 def load_config() -> dict:
-    """每次请求都重新读取配置，改完 config.json 不用重启（端口除外）。"""
+    """每次请求都重新读取配置，改完 config.json 不用重启（端口除外）。
+
+    用 utf-8-sig 读取：记事本「另存为 UTF-8」会写入 BOM，普通 utf-8 解码会让
+    json.loads 直接抛错，表现为双击后进程立刻退出。
+    """
     _ensure_config()
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
         return json.load(f)
 
 

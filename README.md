@@ -64,9 +64,21 @@ cd router
 http://127.0.0.1:8765/
 ```
 
-### 运行发布版
+### 运行发布版（Windows，免安装）
 
-下载或构建 `LLMRouter.exe` 后直接双击即可。运行数据会保存在 EXE 同目录。
+不想装 Python 的话，直接下载打包好的 EXE：
+
+1. 打开 [Releases](https://github.com/xcchc/LLMRouter/releases)，在最新版本的 **Assets** 里下载 `LLMRouter.exe`。
+2. 放到一个单独的文件夹（例如 `D:\LLMRouter\`），双击运行。
+3. 首次启动会在同目录自动生成 `config.json` 和 `stats.jsonl`，界面直接弹出，监听 `http://127.0.0.1:8765/`。
+
+说明：
+
+- 单个 EXE 自带 Python 运行时，不需要安装 Python、也不用装依赖。
+- 程序不写注册表、不写系统目录，删掉文件夹就等于卸载。
+- EXE 没有代码签名，Windows SmartScreen 可能提示“已保护你的电脑”，点“更多信息 → 仍要运行”即可。
+- 如果提示端口被占用，先关掉占用 8765 的程序，或修改 `config.json` 里的 `port`。
+- 配置读不出来时程序会弹窗报错并退出，而不是带着空配置启动（避免覆盖原有供应商列表）。
 
 ## 配置
 
@@ -180,7 +192,9 @@ cd LLMRouter\router
 
 ### 发布给其他用户
 
-需要分发时，把 `router\dist\LLMRouter.exe` 上传到 GitHub Releases。使用者下载后，将其放到正在运行的 Router 同目录并命名为 `LLMRouter.new.exe`，然后按上面的设置页步骤更新。
+打一个 tag 并新建 Release，把 `router\dist\LLMRouter.exe` 作为附件上传（Assets 里保持文件名 `LLMRouter.exe`）。新用户下载后双击即可使用，见上文「运行发布版」。
+
+已经装过旧版的用户，把下载到的 EXE 放到旧版同目录并改名为 `LLMRouter.new.exe`，再按上面的设置页步骤更新即可。
 
 ## API
 

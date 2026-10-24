@@ -113,11 +113,32 @@ if sys.stdout is None or sys.stderr is None:
     sys.stderr = _devnull
 
 
-def load_config() -> dict:
+def _show_error(title: str, text: str) -> None:
+    """EXE 用 --windowed 打包、没有控制台，print 出来的话用户只会看到闪退。"""
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(None, text, title, 0x10)  # MB_ICONERROR
     except Exception:
+        pass
+
+
+_config_error = None
+
+
+def load_config() -> dict:
+    global _config_error
+    try:
+        # utf-8-sig：兼容记事本另存为 UTF-8 时写入的 BOM。
+        with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        _config_error = None
+        return {}
+    except Exception as exc:
+        # 配置坏了不能当成空配置启动，否则界面看起来“供应商全没了”，
+        # 一保存就会把原文件覆盖掉。
+        _config_error = f"{type(exc).__name__}: {exc}"
         return {}
 
 
@@ -153,6 +174,13 @@ def main():
 
     router.migrate_config_on_startup()
     cfg = load_config()
+    if _config_error:
+        _show_error(
+            "LLM Router 无法读取配置",
+            f"配置文件解析失败：\n{CONFIG_PATH}\n\n{_config_error}\n\n"
+            "请修正该文件（或先改名备份，程序会重新生成默认配置）后再启动。",
+        )
+        sys.exit(1)
     port = load_port(cfg)
 
     import stats
@@ -161,6 +189,11 @@ def main():
 
     server, thread = start_server(port)
     if server is None:
+        _show_error(
+            "LLM Router 启动失败",
+            f"端口 {port} 可能已被占用。\n\n"
+            "请关闭占用该端口的程序，或修改同目录 config.json 里的 port 后重试。",
+        )
         print(f"启动失败：端口 {port} 可能已被占用。请关闭占用该端口的程序，或改端口后重试。")
         sys.exit(1)
 
