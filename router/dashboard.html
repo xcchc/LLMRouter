@@ -48,20 +48,25 @@ main{padding:22px 28px 60px;max-width:1560px;margin:0 auto}
 .stat .v{font-size:26px;font-weight:700;letter-spacing:.5px}
 .stat .l{font-size:12px;color:var(--mut);margin-top:4px}
 .stat .a{font-size:11px;color:var(--acc2);margin-top:6px}
+.chk{display:inline-flex;align-items:center;gap:4px;font-size:12px;font-weight:400;color:var(--mut);cursor:pointer;white-space:nowrap}
+.chk input{margin:0;cursor:pointer}
 .grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:18px}
 @media(max-width:900px){.grid2{grid-template-columns:minmax(0,1fr)}}
+/* 窄屏时两个统计表各自占满一行，避免十列挤在一起要横向滚动。 */
+@media(max-width:1250px){#statGrid{grid-template-columns:minmax(0,1fr)}}
 .tblwrap{overflow:auto;max-height:380px}
 .page-pane{min-height:calc(100vh - 78px)}
 .model-route-table{overflow-x:auto}
 table{width:100%;border-collapse:collapse;font-size:13px}
-th{color:var(--mut);font-weight:600;text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap;position:sticky;top:0;background:var(--card2)}
-td{padding:8px 10px;border-bottom:1px solid rgba(38,43,69,.55);white-space:nowrap}
+th{color:var(--mut);font-weight:600;text-align:left;padding:5px 7px;border-bottom:1px solid var(--line);white-space:nowrap;position:sticky;top:0;background:var(--card2)}
+td{padding:5px 7px;border-bottom:1px solid rgba(38,43,69,.55);white-space:nowrap}
+/* 表格各列只按内容占宽，末尾留一列空白吃掉剩余宽度，避免列与列被拉得很开。 */
+#tblRecent th:last-child,#tblRecent td:last-child,
+#tblModel th:last-child,#tblModel td:last-child,
+#tblSupplier th:last-child,#tblSupplier td:last-child{width:100%}
 #tblModelMap tbody tr[draggable]{cursor:grab}
 #tblModelMap tbody tr.dragging{opacity:.55}
 #tblModelMap .drag-cell{cursor:grab;color:var(--mut);text-align:center;user-select:none}
-.compat-grid{display:grid;grid-template-columns:1fr;gap:5px;min-width:220px}
-.compat-grid label{display:block;font-size:11px;color:var(--mut);margin:0}
-.compat-grid select{width:100%;padding:4px 8px;font-size:12px}
 tr:hover td{background:rgba(255,255,255,.025)}
 .num{font-variant-numeric:tabular-nums;text-align:right}
 .badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;background:rgba(124,108,255,.18);color:#b9b1ff;border:1px solid rgba(124,108,255,.35)}
@@ -100,6 +105,7 @@ textarea{width:100%;min-height:70px;resize:vertical}
 :root[data-theme="light"] .chip{color:#5547e8}
 .chip .src{color:var(--mut);font-size:11px;margin-left:6px}
 .muted{color:var(--mut);font-size:12px;line-height:1.7}
+.mut{color:var(--mut)}
 .modal{position:fixed;inset:0;background:rgba(5,6,12,.66);display:flex;align-items:center;justify-content:center;z-index:50;backdrop-filter:blur(4px)}
 :root[data-theme="light"] .modal{background:rgba(40,50,90,.35)}
 .modal.hidden{display:none}
@@ -132,6 +138,7 @@ textarea{width:100%;min-height:70px;resize:vertical}
     <button class="tab active" data-tab="overview">概览</button>
     <button class="tab" data-tab="suppliers">供应商</button>
     <button class="tab" data-tab="models">模型路由</button>
+    <button class="tab" data-tab="agents">Agent 接入</button>
     <button class="tab" data-tab="settings">设置</button>
   </nav>
 </header>
@@ -149,7 +156,7 @@ textarea{width:100%;min-height:70px;resize:vertical}
         <option value="0">全部</option>
         <option value="custom">自定义</option>
       </select>
-      <input type="number" id="nHours" min="1" max="720" step="1" value="1" title="小时数" style="width:76px">
+      <input type="number" id="nHours" min="1" max="720" step="1" value="12" title="小时数" style="width:76px">
       <div class="time-picker" id="timePicker">
         <label for="startTime">开始</label>
         <input type="datetime-local" id="startTime" step="1" title="开始时间（精确到秒）">
@@ -162,12 +169,14 @@ textarea{width:100%;min-height:70px;resize:vertical}
       <div class="card"><h3 id="titleChartReq">近 24 小时请求量</h3><canvas id="chartReq" height="88" style="width:100%;height:88px;display:block"></canvas></div>
       <div class="card"><h3 id="titleChartTok">近 24 小时 Token 用量</h3><canvas id="chartTok" height="88" style="width:100%;height:88px;display:block"></canvas></div>
     </div>
-    <div class="grid2">
+    <div class="grid2" id="statGrid">
       <div class="card"><h3>按模型统计</h3><div class="tblwrap"><table id="tblModel"></table></div></div>
       <div class="card"><h3>按供应商统计</h3><div class="tblwrap"><table id="tblSupplier"></table></div></div>
     </div>
     <div class="card"><h3 style="justify-content:space-between">最近请求（每页 50 条）
-      <span style="display:flex;gap:8px;align-items:center;font-weight:400">
+      <span style="display:flex;gap:10px;align-items:center;font-weight:400">
+        <label class="chk"><input type="checkbox" id="chkOk" checked> 正常请求</label>
+        <label class="chk"><input type="checkbox" id="chkErr" checked> 错误请求</label>
         <button class="btn sm" id="btnPagePrev">上一页</button>
         <span id="pageInfo" class="muted" style="font-size:12px"></span>
         <button class="btn sm" id="btnPageNext">下一页</button>
@@ -195,13 +204,13 @@ textarea{width:100%;min-height:70px;resize:vertical}
         </select>
         <button class="btn primary" id="btnAddModel">添加模型</button>
       </div>
-      <div class="muted" id="newModelHint" style="margin-top:8px">选择供应商后自动获取上游模型；可拖动路由行排序，模型价格直接在路由行设置。</div>
+      <div class="muted" id="newModelHint" style="margin-top:8px">Agent 看到的模型名统一为 <b>供应商/模型名</b>（模型名自带 <code>/</code> 时保留，例如 xkiro/z-ai/glm-5.3）；同名模型挂到多个渠道时，换个供应商再添加一次即可（不会互相覆盖）；可拖动路由行排序，模型价格直接在路由行设置。</div>
       <div class="model-route-table"><table id="tblModelMap"></table></div>
-      <div class="form-row" style="margin-top:16px">
-        <label>默认供应商（兜底）</label>
-        <select id="defaultSupplier" style="min-width:180px"></select>
-        <button class="btn" id="btnSaveDefault">保存</button>
-      </div>
+  </section>
+
+  <section id="tab-agents" class="tabpane">
+    <p class="muted" style="margin:0 0 4px">Codex 桌面版、DeepSeek Harness、Claude Code 可以<b>同时</b>接入 Router，各自走各自的协议端点，互不影响。每个 Agent 可设置默认模型（仅当客户端未指定模型时使用）与推理档位（仅当请求未携带档位时生效）；客户端选择的模型与档位一律原样生效，不再改写。改动立即生效，无需重启。</p>
+    <div id="agentList"></div>
   </section>
 
   <section id="tab-settings" class="tabpane">
@@ -248,6 +257,17 @@ const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const nfmt = n => Number(n || 0).toLocaleString('zh-CN');
 const tfmt = n => { n = Number(n || 0); return n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(1)+'k' : String(n); };
+const fmtSec = ms => ms == null ? '—' : (Number(ms) / 1000).toFixed(2);
+// token 速度：单条请求 = 输出 token ÷ 生成耗时（耗时 − 首字），没有首字数据时退回总耗时。
+const fmtSpeed = (tokens, ms, firstMs) => {
+  let gen = Number(ms) || 0;
+  const first = Number(firstMs);
+  if(firstMs != null && first >= 0 && first < gen) gen -= first;
+  return (gen > 0 && tokens > 0) ? Math.round(Number(tokens) / (gen / 1000)) + ' t/s' : '—';
+};
+const fmtSpeedAgg = v => v > 0 ? Number(v).toFixed(1) + ' t/s' : '—';
+// 平均首字（秒），没有数据时显示 —。
+const fmtFirst = ms => ms > 0 ? (Number(ms) / 1000).toFixed(2) : '—';
 const fmtTime = ts => new Date(ts*1000).toLocaleString('zh-CN', {hour12:false});
 const fmtDuration = ms => ms == null ? '—' : (Number(ms)/1000).toFixed(2) + ' s';
 function imageHandlingMap(s){
@@ -287,6 +307,7 @@ document.querySelectorAll('.tab').forEach(btn => btn.addEventListener('click', (
   $('#tab-' + btn.dataset.tab).classList.add('active');
   if(btn.dataset.tab === 'suppliers') loadSuppliers();
   if(btn.dataset.tab === 'models') loadModelsTab();
+  if(btn.dataset.tab === 'agents') loadAgents();
   if(btn.dataset.tab === 'settings') loadSettings();
   if(btn.dataset.tab === 'overview') loadOverview();
 }));
@@ -344,7 +365,7 @@ function drawBars(canvas, labels, values, color, valueLabel){
 }
 // ---------- overview ----------
 let chartModel = '';
-let timeHours = 1;
+let timeHours = 12;
 let timeMode = 'nhours';
 const clampHours = n => Math.max(1, Math.min(720, Number(n) || 1));
 const timeLabel = () => timeMode === 'custom' ? '自定义时间' : (timeMode === 'nhours' ? `近 ${timeHours} 小时` : ({24:'近 24 小时',168:'近 7 天',720:'近 30 天',0:'全部'}[timeHours] || '近 24 小时'));
@@ -410,7 +431,8 @@ async function loadOverview(){
     const cards = [
       [tl + '请求', s.total.requests, '错误 ' + s.total.errors],
       [tl + ' Tokens', tfmt(s.total.total), '输入 ' + tfmt(s.total.input) + ' · 输出 ' + tfmt(s.total.output)],
-      ['推理 Tokens', tfmt(s.total.reasoning), '范围内合计'],
+      [tl + ' 速度', fmtSpeedAgg(s.total.speed), '输出 token ÷ (耗时 − 首字)'],
+      ['平均首字', s.total.avg_first_token_ms > 0 ? fmtFirst(s.total.avg_first_token_ms) + ' 秒' : '—', ''],
       ['平均耗时', s.total.requests ? Number(s.avg_duration_seconds || 0).toFixed(1) + ' 秒' : '—', ''],
       ['缓存命中率', hitRate, '缓存 ' + tfmt(s.total.cached) + ' / 输入 ' + tfmt(s.total.input)],
     ];
@@ -419,18 +441,34 @@ async function loadOverview(){
     $('#titleChartTok').textContent = tl + ' Token 用量';
     drawBars($('#chartReq'), s.hourly.map(h => h.hour), s.hourly.map(h => h.requests), 'rgba(124,108,255,.85)', '请求量');
     drawBars($('#chartTok'), s.hourly.map(h => h.hour), s.hourly.map(h => h.tokens), 'rgba(95,212,196,.85)', 'Token 用量');
-    const mRows = s.by_model.map(m => `<tr><td>${esc(m.name)}</td><td>${esc(m['supplier'] ?? '')}</td><td class="num">${nfmt(m.requests)}</td><td class="num">${m.errors ? '<span style="color:var(--err)">' + nfmt(m.errors) + '</span>' : '0'}</td><td class="num">${nfmt(m.input)}</td><td class="num">${nfmt(m.cached)}</td><td class="num">${nfmt(m.output)}</td><td class="num">${nfmt(m.reasoning)}</td><td class="num">${nfmt(m.total)}</td><td class="num">${m.cost > 0 ? '¥' + m.cost.toFixed(2) : '—'}</td></tr>`).join('');
-    $('#tblModel').innerHTML = `<thead><tr><th>模型</th><th>供应商</th><th>请求</th><th>错误</th><th>输入</th><th>缓存</th><th>输出</th><th>推理</th><th>总量</th><th>费用</th></tr></thead><tbody>${mRows || '<tr><td colspan="10" class="empty">暂无数据</td></tr>'}</tbody>`;
-    const sRows = s.by_supplier.map(m => `<tr><td>${esc(m.name)}</td><td class="num">${nfmt(m.requests)}</td><td class="num">${m.errors ? '<span style="color:var(--err)">' + nfmt(m.errors) + '</span>' : '0'}</td><td class="num">${nfmt(m.input)}</td><td class="num">${nfmt(m.cached)}</td><td class="num">${nfmt(m.output)}</td><td class="num">${nfmt(m.reasoning)}</td><td class="num">${nfmt(m.total)}</td><td class="num">${m.cost > 0 ? '¥' + m.cost.toFixed(2) : '—'}</td></tr>`).join('');
-    $('#tblSupplier').innerHTML = `<thead><tr><th>供应商</th><th>请求</th><th>错误</th><th>输入</th><th>缓存</th><th>输出</th><th>推理</th><th>总量</th><th>费用</th></tr></thead><tbody>${sRows || '<tr><td colspan="9" class="empty">暂无数据</td></tr>'}</tbody>`;
+    // 统计表用紧凑单位（悬停看精确值），否则十个列在半宽卡片里放不下。
+    const tok = v => `<td class="num" title="${nfmt(v)}">${tfmt(v)}</td>`;
+    const mRows = s.by_model.map(m => `<tr><td>${modelCell(m.name)}</td><td class="num">${nfmt(m.requests)}</td><td class="num">${m.errors ? '<span style="color:var(--err)">' + nfmt(m.errors) + '</span>' : '0'}</td>${tok(m.input)}${tok(m.cached)}${tok(m.output)}<td class="num">${fmtFirst(m.avg_first_token_ms)}</td><td class="num">${fmtSpeedAgg(m.speed)}</td>${tok(m.total)}<td class="num">${m.cost > 0 ? '¥' + m.cost.toFixed(2) : '—'}</td><td></td></tr>`).join('');
+    $('#tblModel').innerHTML = `<thead><tr><th>模型</th><th>请求</th><th>错误</th><th>输入</th><th>缓存</th><th>输出</th><th>首字 (s)</th><th>速度</th><th>总量</th><th>费用</th><th></th></tr></thead><tbody>${mRows || '<tr><td colspan="11" class="empty">暂无数据</td></tr>'}</tbody>`;
+    const sRows = s.by_supplier.map(m => `<tr><td>${esc(m.name)}</td><td class="num">${nfmt(m.requests)}</td><td class="num">${m.errors ? '<span style="color:var(--err)">' + nfmt(m.errors) + '</span>' : '0'}</td>${tok(m.input)}${tok(m.cached)}${tok(m.output)}<td class="num">${fmtFirst(m.avg_first_token_ms)}</td><td class="num">${fmtSpeedAgg(m.speed)}</td>${tok(m.total)}<td class="num">${m.cost > 0 ? '¥' + m.cost.toFixed(2) : '—'}</td><td></td></tr>`).join('');
+    $('#tblSupplier').innerHTML = `<thead><tr><th>供应商</th><th>请求</th><th>错误</th><th>输入</th><th>缓存</th><th>输出</th><th>首字 (s)</th><th>速度</th><th>总量</th><th>费用</th><th></th></tr></thead><tbody>${sRows || '<tr><td colspan="11" class="empty">暂无数据</td></tr>'}</tbody>`;
   }catch(e){ /* 网关未就绪时静默 */ }
 }
 let recentPage = 1;
 const PAGE_SIZE = 50;
+// 公开模型名是 <供应商>/<模型名>：供应商部分弱化，模型名保持正常，一列就能看清归属。
+function modelCell(model){
+  const text = String(model || '?');
+  const i = text.indexOf('/');
+  if(i <= 0) return esc(text);
+  return `<span class="mut">${esc(text.slice(0, i))}</span>/${esc(text.slice(i + 1))}`;
+}
+function statusParam(){
+  const ok = $('#chkOk').checked, err = $('#chkErr').checked;
+  if(ok && err) return '';
+  return ok ? 'ok' : 'error';
+}
 async function loadRecent(){
   try{
     const params = new URLSearchParams({limit: String(PAGE_SIZE), offset: String((recentPage - 1) * PAGE_SIZE)});
     if(chartModel) params.set('model', chartModel);
+    const status = statusParam();
+    if(status) params.set('status', status);
     const tp = timeParams();
     if(tp.hours) params.set('hours', tp.hours);
     if(tp.start) params.set('start', tp.start);
@@ -442,13 +480,13 @@ async function loadRecent(){
     $('#btnPagePrev').disabled = recentPage <= 1;
     $('#btnPageNext').disabled = recentPage >= totalPages;
     const rows = records.slice().reverse().map(r => `<tr>
-      <td>${fmtTime(r.ts)}</td><td>${esc(r.model)}</td><td>${esc(r.reasoning_effort || '—')}</td><td>${esc(r.supplier)}</td>
+      <td>${fmtTime(r.ts)}</td><td>${modelCell(r.model)}</td><td>${esc(r.reasoning_effort || '—')}</td>
       <td><span class="badge ${r.upstream_wire === 'chat' ? 'chat' : ''}">${r.incoming_wire}→${r.upstream_wire}</span></td>
-      <td>${statusBadge(r.status)}</td><td class="num">${fmtDuration(r.duration_ms)}</td>
-      <td class="num">${r.input_tokens ?? '—'}</td><td class="num">${r.cached_tokens > 0 ? '<span style="color:var(--ok)" title="缓存命中，按缓存价计费">✓ ' + nfmt(r.cached_tokens) + '</span>' : '<span class="mut">—</span>'}</td><td class="num">${hitRateCell(r)}</td><td class="num">${r.output_tokens ?? '—'}</td><td class="num">${r.reasoning_tokens ?? '—'}</td><td class="num">${r.total_tokens ?? '—'}</td>
-      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis" title="${esc(r.error || '')}">${esc((r.error || '').slice(0, 40))}</td>
+      <td>${statusBadge(r.status)}</td><td class="num">${fmtDuration(r.duration_ms)}</td><td class="num">${fmtSec(r.first_token_ms)}</td>
+      <td class="num">${r.input_tokens ?? '—'}</td><td class="num">${r.cached_tokens > 0 ? '<span style="color:var(--ok)" title="缓存命中，按缓存价计费">✓ ' + nfmt(r.cached_tokens) + '</span>' : '<span class="mut">—</span>'}</td><td class="num">${hitRateCell(r)}</td><td class="num">${r.output_tokens ?? '—'}</td><td class="num">${fmtSpeed(r.output_tokens, r.duration_ms, r.first_token_ms)}</td><td class="num">${r.total_tokens ?? '—'}</td>
+      <td class="err-cell" title="${esc(r.error || '')}">${esc((r.error || '').slice(0, 40))}</td><td></td>
     </tr>`).join('');
-    $('#tblRecent').innerHTML = `<thead><tr><th>时间</th><th>模型</th><th>推理强度</th><th>供应商</th><th>协议</th><th>状态</th><th>耗时 (s)</th><th>输入</th><th>缓存</th><th>命中率</th><th>输出</th><th>推理</th><th>总量</th><th>错误</th></tr></thead><tbody>${rows || '<tr><td colspan="14" class="empty">暂无请求记录</td></tr>'}</tbody>`;
+    $('#tblRecent').innerHTML = `<thead><tr><th>时间</th><th>模型</th><th>推理强度</th><th>协议</th><th>状态</th><th>耗时 (s)</th><th>首字 (s)</th><th>输入</th><th>缓存</th><th>命中率</th><th>输出</th><th>速度 (t/s)</th><th>总量</th><th>错误</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="15" class="empty">暂无请求记录</td></tr>'}</tbody>`;
   }catch(e){}
 }
 // ---------- suppliers ----------
@@ -470,7 +508,7 @@ async function loadSuppliers(){
       const compatText = s.responses_compat === 'minimax' ? '<span class="badge">MiniMax Compat</span>' : '';
       const cacheForwardText = s.forward_prompt_cache_key ? '<span class="badge">缓存键透传</span>' : '';
       return `<div class="card supplier-card">
-        <div class="head"><span class="name">${esc(s.name)}</span><span class="badge ${s.wire_api === 'chat' ? 'chat' : ''}">${esc(s.wire_api || 'responses')}</span>${compatText}${cacheForwardText}${cfg.default_supplier === s.name ? '<span class="badge mut">默认</span>' : ''}</div>
+        <div class="head"><span class="name">${esc(s.name)}</span><span class="badge ${s.wire_api === 'chat' ? 'chat' : ''}">${esc(s.wire_api || 'responses')}</span>${compatText}${cacheForwardText}</div>
         <div class="row">地址：<b>${esc(s.base_url)}</b></div>
         <div class="row">Key：<b>${key}</b></div>
         <div class="row">手动模型：<b>${(s.models || []).length} 个</b>（其余自动获取）</div>
@@ -682,6 +720,8 @@ function setModelRouteOptions(models, selectedModel=''){
     const model = String(mid || '').trim();
     if(model && !unique.includes(model)) unique.push(model);
   });
+  // 按首字母升序（忽略大小写），带数字的版本号按数值比较：gpt-5.9 排在 gpt-5.10 前面。
+  unique.sort(cmpModelName);
   select.innerHTML = unique.length
     ? '<option value="">（选择模型）</option>' + unique.map(mid => `<option value="${esc(mid)}">${esc(mid)}</option>`).join('')
     : '<option value="">（暂无可用模型）</option>';
@@ -713,34 +753,42 @@ async function refreshModelRouteOptions(supplierName, selectedModel=''){
   }
 }
 
+// Agent 侧看到的公开模型名：<供应商>/<模型名>，模型名内部的 / 原样保留。
+function qualifiedModelId(supplier, model){
+  const sup = String(supplier || '').trim();
+  const mid = String(model || '').trim();
+  if(!sup || !mid) return mid;
+  return sup + '/' + mid;
+}
+// 模型名排序：忽略大小写，数字段按数值比较（gpt-5.9 排在 gpt-5.10 前）。
+function cmpModelName(a, b){
+  const x = String(a ?? ''), y = String(b ?? '');
+  return x.localeCompare(y, 'en', {numeric: true, sensitivity: 'base'}) || x.localeCompare(y, 'en');
+}
+
 async function loadModelsTab(){
   try{
     const cfg = await api('/api/config');
     window.__routerConfigSuppliers = cfg.suppliers || [];
     const previousSupplier = $('#newModelSupplier').value;
-    const supOpts = cfg.suppliers.map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
+    const sortedSuppliers = (cfg.suppliers || []).slice().sort((a, b) => cmpModelName(a.name, b.name));
+    const supOpts = sortedSuppliers.map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
     $('#newModelSupplier').innerHTML = supOpts;
-    $('#defaultSupplier').innerHTML = '<option value="">（不设置）</option>' + supOpts;
-    $('#defaultSupplier').value = cfg.default_supplier || '';
-    const currentSupplier = cfg.suppliers.some(s => s.name === previousSupplier)
+    const currentSupplier = sortedSuppliers.some(s => s.name === previousSupplier)
       ? previousSupplier
-      : (cfg.suppliers[0] && cfg.suppliers[0].name) || '';
+      : (sortedSuppliers[0] && sortedSuppliers[0].name) || '';
     $('#newModelSupplier').value = currentSupplier;
     await refreshModelRouteOptions(currentSupplier);
     const mm = cfg.model_map || {};
-    const mo = cfg.model_overrides || {};
-    const keys = Object.keys(mm);
-    $('#tblModelMap').innerHTML = `<thead><tr><th></th><th>模型名</th><th>路由到供应商</th><th>价格</th><th>兼容设置</th><th></th></tr></thead><tbody>${
+    const keys = Object.keys(mm).sort(cmpModelName);
+    $('#tblModelMap').innerHTML = `<thead><tr><th></th><th>Agent 看到的模型名</th><th>上游模型 / 供应商</th><th>价格</th><th></th></tr></thead><tbody>${
       keys.map(k => {
-        const ov = mo[k] || {};
-        const sanitize = ov.openai_sanitize == null ? 'inherit' : String(ov.openai_sanitize);
-        const cacheKey = ov.forward_prompt_cache_key == null ? 'inherit' : String(ov.forward_prompt_cache_key);
-        return `<tr data-model="${esc(k)}" draggable="true"><td class="drag-cell" title="拖动排序">⋮⋮</td><td>${esc(k)}</td><td><select class="mm-sel">${supOpts.replace(/<option value="([^"]+)"/g, (m, v) => `<option value="${esc(v)}"${v === mm[k] ? ' selected' : ''}`)}</select></td><td>${modelPriceText(k, mm[k], cfg)}</td><td><div class="compat-grid"><label>Responses 字段</label><select class="mo-sel" data-key="openai_sanitize"><option value="inherit"${sanitize === 'inherit' ? ' selected' : ''}>跟随供应商</option><option value="false"${sanitize === 'false' ? ' selected' : ''}>完整透传</option><option value="true"${sanitize === 'true' ? ' selected' : ''}>兼容清洗</option></select><label>prompt_cache_key</label><select class="mo-sel" data-key="forward_prompt_cache_key"><option value="inherit"${cacheKey === 'inherit' ? ' selected' : ''}>跟随供应商</option><option value="true"${cacheKey === 'true' ? ' selected' : ''}>透传</option><option value="false"${cacheKey === 'false' ? ' selected' : ''}>删除</option></select></div></td><td><button class="btn sm" data-price-model="${esc(k)}" data-price-supplier="${esc(mm[k])}">设价</button> <button class="btn sm danger" data-del-model="${esc(k)}">删除</button></td></tr>`;
+        const sup = mm[k];
+        const upstream = String(k).startsWith(sup + '/') ? String(k).slice(sup.length + 1) : k;
+        return `<tr data-model="${esc(k)}" data-supplier="${esc(sup)}" draggable="true"><td class="drag-cell" title="拖动排序">⋮⋮</td><td title="Agent 里填这个模型名">${modelCell(k)}</td><td><span class="mut">${esc(upstream)}</span> → ${esc(sup)}</td><td>${modelPriceText(k, sup, cfg)}</td><td><button class="btn sm" data-price-model="${esc(k)}" data-price-supplier="${esc(sup)}">设价</button> <button class="btn sm danger" data-del-model="${esc(k)}">删除</button></td></tr>`;
       }).join('')
-      || '<tr><td colspan="6" class="empty">暂无映射。在上方选择供应商和模型后添加。</td></tr>'
+      || '<tr><td colspan="5" class="empty">暂无映射。在上方选择供应商和模型后添加。</td></tr>'
     }</tbody>`;
-    document.querySelectorAll('.mm-sel').forEach(sel => sel.addEventListener('change', saveModelMap));
-    document.querySelectorAll('.mo-sel').forEach(sel => sel.addEventListener('change', saveModelMap));
     document.querySelectorAll('[data-price-model]').forEach(btn => btn.onclick = () => openModelPriceModal(btn.dataset.priceModel, btn.dataset.priceSupplier));
     document.querySelectorAll('[data-del-model]').forEach(btn => btn.onclick = () => delModelMap(btn.dataset.delModel));
     setupModelMapDrag();
@@ -770,25 +818,20 @@ function setupModelMapDrag(){
     };
     row.ondrop = e => {
       e.preventDefault();
-      saveModelMap();
+      // 拖完不要立刻重排，否则看起来像"弹回去了"；下次进入本页仍按字母序显示。
+      saveModelMap(false);
     };
   });
 }
-async function saveModelMap(){
-  const cfg = await api('/api/config');
+async function saveModelMap(reload = true){
   const mm = {};
-  const mo = {};
   document.querySelectorAll('#tblModelMap tbody tr[data-model]').forEach(tr => {
-    mm[tr.dataset.model] = tr.querySelector('select').value;
-    tr.querySelectorAll('.mo-sel').forEach(sel => {
-      if(sel.value === 'inherit') return;
-      mo[tr.dataset.model] = mo[tr.dataset.model] || {};
-      mo[tr.dataset.model][sel.dataset.key] = sel.value === 'true';
-    });
+    mm[tr.dataset.model] = tr.dataset.supplier;
   });
   try{
-    await api('/api/model_map', {method:'PUT', body: JSON.stringify({model_map: mm, model_overrides: mo, default_supplier: $('#defaultSupplier').value})});
-    toast('已保存'); loadModelsTab();
+    await api('/api/model_map', {method:'PUT', body: JSON.stringify({model_map: mm})});
+    toast('已保存');
+    if(reload) loadModelsTab();
   }catch(e){ toast(e.message, 'bad'); }
 }
 async function delModelMap(model){
@@ -917,6 +960,124 @@ async function applyUpdate(){
     btn.disabled = false;
   }
 }
+// ---------- agents ----------
+const AGENT_EFFORTS = ['','none','minimal','low','medium','high','xhigh','max','ultra'];
+function agentSnippet(id, base){
+  const root = base.replace(/\/v1\/?$/, '');
+  if(id === 'codex'){
+    return [
+      'Codex++ / Codex Switch 新增供应商：',
+      '接口地址：' + base,
+      '协议：Responses',
+      'API Key：任意非空占位值（如 local-router）',
+    ].join('\n');
+  }
+  if(id === 'dsh'){
+    const agentModels = window.__agentModels || [];
+    const modelLines = agentModels.length
+      ? agentModels.map(m => '          - id: ' + m + '\n            name: ' + m).join('\n')
+      : '          - id: <模型名>\n            name: <模型名>';
+    return [
+      '# DeepSeek Harness：%USERPROFILE%\\.dsh\\profiles\\desktop\\cordis.patch.yml',
+      '- id: llm-pi-ai',
+      '  name: "@deepseek-ai/dsh-llm-pi-ai"',
+      '  config:',
+      '    providers:',
+      '      llmrouter:',
+      '        displayName: llmrouter',
+      '        apiKeyEnv: LLMROUTER_API_KEY',
+      '        api: openai-completions',
+      '        baseURL: ' + base,
+      '        models:',
+      modelLines,
+    ].join('\n');
+  }
+  return [
+    '# Claude Code（PowerShell，当前会话生效）：',
+    '$env:ANTHROPIC_BASE_URL = "' + root + '"',
+    '$env:ANTHROPIC_AUTH_TOKEN = "local-router"   # 任意非空即可',
+    '',
+    '# 或写入 %USERPROFILE%\\.claude\\settings.json 的 env 字段：',
+    '{',
+    '  "env": {',
+    '    "ANTHROPIC_BASE_URL": "' + root + '",',
+    '    "ANTHROPIC_AUTH_TOKEN": "local-router"',
+    '  }',
+    '}',
+  ].join('\n');
+}
+async function copyAgentSnippet(id){
+  const txt = agentSnippet(id, window.__agentBase || $('#baseUrl').textContent.trim());
+  try{
+    await navigator.clipboard.writeText(txt);
+    toast('已复制接入配置');
+  }catch(e){
+    const ta = document.createElement('textarea');
+    ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try{ document.execCommand('copy'); toast('已复制接入配置'); }
+    catch(e2){ toast('复制失败，请手动复制', 'bad'); }
+    ta.remove();
+  }
+}
+async function saveAgentSetting(id, body){
+  try{
+    await api('/api/agents/' + id, {method:'PUT', body: JSON.stringify(body)});
+    toast('已保存，立即生效');
+  }catch(e){ toast(e.message, 'bad'); }
+}
+async function testAgent(id){
+  const out = document.getElementById('agentTest-' + id);
+  if(out) out.textContent = '测试中…';
+  try{
+    const sel = document.querySelector('.agentModel[data-agent="' + id + '"]');
+    const r = await api('/api/agents/' + id + '/test', {method:'POST', body: JSON.stringify({model: sel ? sel.value : ''})});
+    if(out){
+      out.textContent = r.ok
+        ? ('✓ HTTP ' + r.http_status + ' · ' + r.duration_ms + 'ms · ' + (r.preview || 'ok'))
+        : ('✗ ' + (r.error || ('HTTP ' + r.http_status)));
+    }
+  }catch(e){
+    if(out) out.textContent = '✗ ' + e.message;
+  }
+}
+async function loadAgents(){
+  let data;
+  try{ data = await api('/api/agents'); }
+  catch(e){ $('#agentList').innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>'; return; }
+  window.__agentBase = data.base_url || $('#baseUrl').textContent.trim();
+  window.__agentModels = data.models || [];
+  $('#agentList').innerHTML = data.agents.map(a => {
+    const last = a.last_ts
+      ? esc(fmtTime(a.last_ts)) + ' · ' + esc(a.last_model || '?')
+      : '尚未收到该 Agent 的请求';
+    const modelOptions = ['<option value="">跟随全局路由</option>']
+      .concat((data.models || []).map(m => '<option value="' + esc(m) + '"' + (a.default_model === m ? ' selected' : '') + '>' + esc(m) + '</option>'))
+      .join('');
+    const effortOptions = AGENT_EFFORTS.map(v =>
+      '<option value="' + v + '"' + (a.reasoning_effort === v ? ' selected' : '') + '>' + (v === '' ? '跟随请求' : v) + '</option>'
+    ).join('');
+    return '<div class="card" style="margin-top:14px">' +
+      '<h3>' + esc(a.label) + ' <span class="chip">' + esc(a.endpoint) + '</span></h3>' +
+      '<div class="muted">最近请求：<b>' + last + '</b>；24h 请求 ' + a.requests_24h + ' 次 / 失败 ' + a.errors_24h + ' 次</div>' +
+      '<div class="form-row" style="margin-top:8px">' +
+        '<label>默认模型</label>' +
+        '<select class="agentModel" data-agent="' + a.id + '" style="min-width:240px">' + modelOptions + '</select>' +
+        '<label>推理档位</label>' +
+        '<select class="agentEffort" data-agent="' + a.id + '" style="min-width:180px">' + effortOptions + '</select>' +
+      '</div>' +
+      '<div class="form-row" style="margin-top:8px">' +
+        '<button class="btn" data-copy-agent="' + a.id + '">复制接入配置</button>' +
+        '<button class="btn primary" data-test-agent="' + a.id + '">测试连接</button>' +
+        '<span class="muted" id="agentTest-' + a.id + '"></span>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+  document.querySelectorAll('[data-copy-agent]').forEach(b => b.onclick = () => copyAgentSnippet(b.dataset.copyAgent));
+  document.querySelectorAll('[data-test-agent]').forEach(b => b.onclick = () => testAgent(b.dataset.testAgent));
+  document.querySelectorAll('.agentModel').forEach(s => s.onchange = () => saveAgentSetting(s.dataset.agent, {default_model: s.value}));
+  document.querySelectorAll('.agentEffort').forEach(s => s.onchange = () => saveAgentSetting(s.dataset.agent, {reasoning_effort: s.value}));
+}
 // ---------- events & init ----------
 $('#btnAddSupplier').onclick = () => openSupplierModal(null);
 $('#btnRefreshSuppliers').onclick = loadSuppliers;
@@ -930,7 +1091,7 @@ $('#timeFilter').addEventListener('change', e => {
   const v = e.target.value;
   if(v === 'custom'){ timeMode = 'custom'; timeHours = 24; }
   else if(v === 'nhours'){ timeMode = 'nhours'; timeHours = clampHours($('#nHours').value); }
-  else { timeMode = 'hours'; timeHours = Number(v) || 24; }
+  else { timeMode = 'hours'; timeHours = v === '0' ? 0 : (Number(v) || 24); }
   applyTimePicker(v);
   recentPage = 1;
   loadOverview(); loadRecent();
@@ -954,15 +1115,23 @@ $('#btnAddModel').onclick = async () => {
   if(!model){ toast('请先选择模型', 'bad'); return; }
   try{
     await api('/api/models', {method:'POST', body: JSON.stringify({model, supplier: $('#newModelSupplier').value, mode: $('#newModelMode').value})});
-    toast('已添加'); await loadModelsTab();
+    toast('已添加：' + qualifiedModelId($('#newModelSupplier').value, model)); await loadModelsTab();
   }catch(e){ toast(e.message, 'bad'); }
 };
 $('#newModelSupplier').onchange = () => refreshModelRouteOptions($('#newModelSupplier').value, '');
 $('#newModelName').onchange = () => {
   const selected = $('#newModelName').value;
-  if(selected) $('#newModelHint').textContent = `已选择模型：${selected}`;
+  if(selected){
+    const publicId = qualifiedModelId($('#newModelSupplier').value, selected);
+    $('#newModelHint').textContent = `已选择模型：${publicId}（Agent 看到的公开模型名）`;
+  }
 };
-$('#btnSaveDefault').onclick = saveModelMap;
+const onStatusToggle = e => {
+  if(!$('#chkOk').checked && !$('#chkErr').checked) e.target.checked = true;
+  recentPage = 1; loadRecent();
+};
+$('#chkOk').onchange = onStatusToggle;
+$('#chkErr').onchange = onStatusToggle;
 $('#btnSaveSettings').onclick = saveSettings;
 $('#btnCheckUpdate').onclick = loadUpdateStatus;
 $('#btnApplyUpdate').onclick = applyUpdate;

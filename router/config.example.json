@@ -40,14 +40,18 @@
       "image_handling": {}
     }
   ],
-  "model_reasoning_efforts": {
-    "gpt-example": "high"
-  },
   "model_map": {
-    "gpt-example": "responses-provider",
-    "deepseek-example": "chat-provider",
-    "gpt-image-2": "image-provider"
+    "responses-provider/gpt-example": "responses-provider",
+    "chat-provider/deepseek-example": "chat-provider",
+    "image-provider/gpt-image-2": "image-provider"
   },
-  "default_supplier": "",
-  "model_blacklist": []
+  "model_blacklist": [],
+  "model_max_output_tokens": {
+    "chat-provider/deepseek-example": 65536
+  },
+  "agent_profiles": {
+    "codex": { "default_model": "", "reasoning_effort": "" },
+    "dsh": { "default_model": "", "reasoning_effort": "" },
+    "claude-code": { "default_model": "", "reasoning_effort": "" }
+  }
 }

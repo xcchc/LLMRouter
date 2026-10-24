@@ -6,7 +6,7 @@ LLM Router 是一个本地 OpenAI 兼容路由网关。Codex++ 只需要连接�
 
 ## 主要能力
 
-- 按模型名选择供应商，也可配置默认供应商兜底。
+- 按模型名选择供应商：模型名统一写成 `<供应商>/<模型名>`，同名模型不会互相混淆。
 - 聚合上游模型列表，并支持手动补充或隐藏模型。
 - 同时接收 `/v1/responses`、`/v1/chat/completions`、`/v1/images/generations` 和 `/v1/images/edits` 请求。
 - 在 Responses 与 Chat 协议之间转换文本、推理内容、用量统计、图片输入和 JSON Schema 输出格式。
@@ -74,12 +74,23 @@ Copy-Item config.example.json config.json
 - `image_handling`：供应商内按模型名配置图片处理模式，取值为 `send-as-is`、`strip` 或 `vlm`；缺省为 `send-as-is`。
 - `vlm_supplier`：`vlm` 模式使用的视觉辅助供应商名称，复用其 `base_url` 和 `api_key`。
 - `vlm_model`：视觉辅助供应商使用的视觉模型名，例如 `gpt-5.6-luna`。
-- `model_map`：模型名到供应商名的显式映射。
-- `default_supplier`：没有显式映射时使用的默认供应商。
+- `model_map`：公开模型名到供应商名的显式映射，键就是 `<供应商>/<模型名>`（值只作标注，选路只看键）。
+- `default_supplier`：已废弃。Router 不再按默认供应商兜底，模型名必须带供应商前缀。
 - `model_blacklist`：不在合并模型列表中展示的模型。
-- `model_reasoning_efforts`：按模型配置默认思考强度。仅当 Chat 请求完全没有携带思考强度时才会补充，不会覆盖客户端显式值。
+- `agent_profiles`：Agent 接入预设。`default_model` 仅当客户端未指定模型时填入（客户端选的模型原样使用）；`reasoning_effort` 仅当请求未显式携带档位时生效。
 
 除监听端口外，配置会在请求时重新读取。修改端口后，请完全退出 Router，再手动启动。
+
+## 模型命名：`<供应商>/<模型名>`
+
+多个渠道可能提供同名模型（例如 `deepseek-v4.1-flash`），因此 `/v1/models` 对外返回的 `id` 统一是 `<供应商>/<模型名>`，`owned_by` 是对应供应商：
+
+- 模型名自带 `/` 时原样保留，只在最前面加供应商：`xkiro` 渠道的 `z-ai/glm-5.3` 显示为 `xkiro/z-ai/glm-5.3`；
+- 解析时只在**第一个** `/` 处切分，第一段必须是已配置的供应商名，剩下的部分作为上游模型名转发；没有别名表，也没有默认供应商兜底；
+- 统计、`model_prices`、`model_max_output_tokens`、`agent_profiles.*.default_model` 都按公开模型名记账，Router 启动时会把旧配置里的裸模型名自动补成 `<供应商>/<模型名>`（只迁移一次并写回 `config.json`）；
+- `image_handling`、`model_blacklist` 仍按供应商内的上游真实模型名配置。
+
+同名模型挂到多个供应商时，公开名带供应商前缀，所以会得到 `pixel/deepseek-v4.1-flash`、`xkiro/deepseek-v4.1-flash` 两个互不冲突的名字；在模型路由页选择供应商后重复添加即可。
 
 ## 接入 Codex++
 
@@ -89,14 +100,14 @@ Copy-Item config.example.json config.json
 - API Key：任意非空占位值
 - 协议：Responses
 
-Codex++ 始终连接这个本地供应商。切换模型时，Router 根据 `model_map`、供应商模型列表和 `default_supplier` 选择上游。
+Codex++ 始终连接这个本地供应商。切换模型时，Router 只在第一个 `/` 处切分模型名：前半段必须是已配置的供应商，后半段原样转发给上游；模型名请使用 `/v1/models` 返回的 `<供应商>/<模型名>`。
 
 ## 图片生成代理
 
 `new-imagegen` 这类生图 Skill 不需要直接读取上游供应商地址。只需：
 
 - 在 Router 供应商列表中添加图片供应商，填写它的 `base_url`、`api_key` 和 `models`。
-- 在 `model_map` 中把生图模型映射到该供应商，例如 `"gpt-image-2": "pixel-ds-img"`。
+- 在 `model_map` 中把生图模型映射到该供应商，例如 `"pixel-ds-img/gpt-image-2": "pixel-ds-img"`。
 - 让 Skill 调用 `http://127.0.0.1:8765`，Router 会按模型名转发到供应商的 `/v1/images/generations` 或 `/v1/images/edits`。
 
 Router 不会把供应商的 `api_key` 返回给 Skill，也不会要求 Skill 知道供应商的真实地址。
@@ -165,7 +176,7 @@ Router 不会把供应商的 `api_key` 返回给 Skill，也不会要求 Skill �
 
 **模型没有可用上游**
 
-检查模型是否存在于供应商模型列表或 `model_map` 中，并确认已经配置 `default_supplier`。
+检查模型名是不是 `<供应商>/<模型名>`，且前半段与供应商配置里的 `name` 完全一致；也可以先在控制台「模型路由」里添加该模型，再复制 `/v1/models` 返回的 `id` 使用。
 
 **某个模型报错，其他模型正常**
 

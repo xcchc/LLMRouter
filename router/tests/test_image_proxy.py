@@ -77,7 +77,7 @@ class ImageProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent.headers["authorization"], "Bearer test-key")
         self.assertEqual(b'"red cube"' in sent.content, True)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(records[0]["model"], "gpt-image-2")
+        self.assertEqual(records[0]["model"], "image-provider/gpt-image-2")
         self.assertEqual(records[0]["supplier"], "image-provider")
         self.assertTrue(FakeImageClient.closed)
 
@@ -104,7 +104,7 @@ class ImageProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent.content, raw)
         self.assertIn("multipart/form-data", sent.headers["content-type"])
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(records[0]["model"], "gpt-image-2")
+        self.assertEqual(records[0]["model"], "image-provider/gpt-image-2")
 
     async def test_unknown_model_returns_404(self):
         async def find_supplier(_cfg, _model):

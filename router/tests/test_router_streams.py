@@ -305,6 +305,41 @@ class RouterStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(records[0]["output_tokens"], 8)
         self.assertEqual(records[0]["total_tokens"], 108)
 
+    async def test_qualified_model_name_is_forwarded_without_the_supplier_prefix(self):
+        CaptureChatUsageClient.requests = []
+        records = []
+        supplier = {
+            "name": "xkiro",
+            "base_url": "https://api.xkiro.com/v1",
+            "api_key": "test-key",
+            "wire_api": "chat",
+        }
+        cfg = {"suppliers": [supplier], "model_map": {}, "model_blacklist": {}}
+
+        request = FakeRequest({
+            "model": "xkiro/z-ai/glm-5.3-flash",
+            "input": "Say ok.",
+            "stream": True,
+        })
+        with (
+            patch.object(router, "load_config", return_value=cfg),
+            patch.object(router.httpx, "AsyncClient", CaptureChatUsageClient),
+            patch.object(router.stats, "record", side_effect=records.append),
+            patch.dict(router._model_cache, {}, clear=True),
+        ):
+            response = await router.relay(request, "responses")
+            _ = b"".join([chunk async for chunk in response.body_iterator])
+
+        sent = json.loads(CaptureChatUsageClient.requests[0].content)
+        # 上游只认模型名本身，供应商前缀不能发出去。
+        self.assertEqual(sent["model"], "z-ai/glm-5.3-flash")
+        # 统计按公开模型名 <供应商>/<模型名> 记账，价格表按同一个键匹配。
+        self.assertEqual(records[0]["model"], "xkiro/z-ai/glm-5.3-flash")
+        self.assertEqual(records[0]["supplier"], "xkiro")
+        # 流式请求记录首字耗时，且不超过总耗时。
+        self.assertIsNotNone(records[0]["first_token_ms"])
+        self.assertLessEqual(records[0]["first_token_ms"], records[0]["duration_ms"])
+
     async def test_direct_responses_transport_error_becomes_response_failed(self):
         records = []
 
@@ -398,7 +433,7 @@ class RouterStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b'"type": "response.completed"', body)
         self.assertEqual(records[0]["status"], "ok")
 
-    async def test_chat_to_responses_relay_applies_configured_effort(self):
+    async def test_chat_to_responses_relay_does_not_inject_model_effort(self):
         sent = await self._relay_and_get_sent_chat_body(
             {
                 "name": "pixel",
@@ -414,7 +449,7 @@ class RouterStreamTests(unittest.IsolatedAsyncioTestCase):
             load_config_result={"model_reasoning_efforts": {"gpt-6-astra": "xhigh"}},
         )
 
-        self.assertEqual(sent["reasoning"], {"effort": "xhigh"})
+        self.assertNotIn("reasoning", sent)
 
     async def test_xkiro_chat_normalizes_responses_reasoning_object(self):
         sent = await self._relay_and_get_sent_chat_body(
@@ -467,6 +502,138 @@ class RouterStreamTests(unittest.IsolatedAsyncioTestCase):
             router._last_session_model = previous
 
         self.assertEqual(models, ["z-ai/glm-5.3-flash"])
+
+    async def test_title_generation_in_input_uses_recent_session_model(self):
+        models = []
+
+        async def find_supplier(_cfg, model):
+            models.append(model)
+            return {
+                "name": "pixel",
+                "base_url": "https://ai-pixel.online",
+                "api_key": "test-key",
+                "wire_api": "responses",
+            }
+
+        request = FakeRequest({
+            "model": "gpt-5.6-luna",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Session context."},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "You are a helpful assistant. You will be presented "
+                                "with a user prompt, and your job is to provide a "
+                                "short title for a task."
+                            ),
+                        },
+                    ],
+                },
+            ],
+            "stream": True,
+        })
+        previous = router._last_session_model
+        router._last_session_model = "z-ai/glm-5.3-flash"
+        try:
+            with (
+                patch.object(router, "load_config", return_value={}),
+                patch.object(router, "find_supplier", new=find_supplier),
+                patch.object(router.stats, "record"),
+            ):
+                await router.relay(request, "responses")
+        finally:
+            router._last_session_model = previous
+
+        self.assertEqual(models, ["z-ai/glm-5.3-flash"])
+
+    async def test_title_generation_forwards_session_model_to_upstream(self):
+        CaptureChatUsageClient.requests = []
+
+        async def find_supplier(_cfg, _model):
+            return {
+                "name": "xkiro",
+                "base_url": "https://api.xkiro.com/v1",
+                "api_key": "test-key",
+                "wire_api": "chat",
+            }
+
+        request = FakeRequest({
+            "model": "gpt-5.6-luna",
+            "instructions": (
+                "You are a helpful assistant. You will be presented with a user prompt"
+            ),
+            "input": "Fix login bug.",
+            "stream": True,
+        })
+        previous = router._last_session_model
+        router._last_session_model = "z-ai/glm-5.3-flash"
+        try:
+            with (
+                patch.object(router, "load_config", return_value={}),
+                patch.object(router, "find_supplier", new=find_supplier),
+                patch.object(router.httpx, "AsyncClient", CaptureChatUsageClient),
+                patch.object(router.stats, "record"),
+            ):
+                response = await router.relay(request, "responses")
+                _ = b"".join([chunk async for chunk in response.body_iterator])
+        finally:
+            router._last_session_model = previous
+
+        sent = json.loads(CaptureChatUsageClient.requests[0].content)
+        self.assertEqual(sent["model"], "z-ai/glm-5.3-flash")
+
+    async def test_transport_error_without_message_records_exception_name(self):
+        class WriteError(Exception):
+            """Simulates httpx.WriteError, whose str() can be empty."""
+
+        class EmptyMessageErrorClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def build_request(self, method, url, **kwargs):
+                return httpx.Request(method, url, **kwargs)
+
+            async def send(self, request, stream=False):
+                raise WriteError()
+
+            async def aclose(self):
+                pass
+
+        records = []
+
+        async def find_supplier(_cfg, _model):
+            return {
+                "name": "xkiro",
+                "base_url": "https://api.xkiro.com/v1",
+                "api_key": "test-key",
+                "wire_api": "chat",
+            }
+
+        request = FakeRequest({
+            "model": "z-ai/glm-5.3-flash",
+            "input": "Say ok.",
+            "stream": True,
+        })
+        with (
+            patch.object(router, "load_config", return_value={}),
+            patch.object(router, "find_supplier", new=find_supplier),
+            patch.object(router.httpx, "AsyncClient", EmptyMessageErrorClient),
+            patch.object(router.stats, "record", side_effect=records.append),
+        ):
+            await router.relay(request, "responses")
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "error")
+        self.assertEqual(records[0]["http_status"], 0)
+        self.assertEqual(records[0]["error"], "WriteError")
 
     async def test_xkiro_chat_keeps_top_level_effort_from_responses_request(self):
         sent = await self._relay_and_get_sent_chat_body(
@@ -737,8 +904,7 @@ class RouterRequestConversionTests(unittest.TestCase):
 
         self.assertEqual(chat["reasoning_effort"], "max")
 
-    def test_configured_reasoning_effort_fills_responses_upstream(self):
-        cfg = {"model_reasoning_efforts": {"gpt-6-astra": "xhigh"}}
+    def test_profile_effort_fills_responses_upstream(self):
         body = {
             "model": "gpt-6-astra",
             "messages": [{"role": "user", "content": "Say ok."}],
@@ -746,16 +912,14 @@ class RouterRequestConversionTests(unittest.TestCase):
 
         out = router._apply_configured_reasoning_effort(
             router.chat_to_responses(body),
-            cfg,
-            body["model"],
             "responses",
             source_body=body,
+            profile_effort="xhigh",
         )
 
         self.assertEqual(out["reasoning"], {"effort": "xhigh"})
 
-    def test_configured_reasoning_effort_fills_chat_upstream(self):
-        cfg = {"model_reasoning_efforts": {"gpt-6-astra": "xhigh"}}
+    def test_profile_effort_fills_chat_upstream(self):
         body = {
             "model": "gpt-6-astra",
             "messages": [{"role": "user", "content": "Say ok."}],
@@ -763,33 +927,14 @@ class RouterRequestConversionTests(unittest.TestCase):
 
         out = router._apply_configured_reasoning_effort(
             dict(body),
-            cfg,
-            body["model"],
             "chat",
             source_body=body,
+            profile_effort="high",
         )
 
-        self.assertEqual(out["reasoning_effort"], "xhigh")
+        self.assertEqual(out["reasoning_effort"], "high")
 
-    def test_configured_reasoning_effort_fills_xkiro_chat_model(self):
-        cfg = {"model_reasoning_efforts": {"z-ai/glm-5.3-flash": "max"}}
-        body = {
-            "model": "z-ai/glm-5.3-flash",
-            "messages": [{"role": "user", "content": "Say ok."}],
-        }
-
-        out = router._apply_configured_reasoning_effort(
-            dict(body),
-            cfg,
-            body["model"],
-            "chat",
-            source_body=body,
-        )
-
-        self.assertEqual(out["reasoning_effort"], "max")
-
-    def test_configured_reasoning_effort_does_not_override_explicit_value(self):
-        cfg = {"model_reasoning_efforts": {"gpt-6-astra": "xhigh"}}
+    def test_profile_effort_does_not_override_explicit_value(self):
         body = {
             "model": "gpt-6-astra",
             "messages": [{"role": "user", "content": "Say ok."}],
@@ -798,16 +943,14 @@ class RouterRequestConversionTests(unittest.TestCase):
 
         out = router._apply_configured_reasoning_effort(
             router.chat_to_responses(body),
-            cfg,
-            body["model"],
             "responses",
             source_body=body,
+            profile_effort="xhigh",
         )
 
         self.assertEqual(out["reasoning"], {"effort": "low"})
 
-    def test_configured_reasoning_effort_preserves_explicit_empty_value(self):
-        cfg = {"model_reasoning_efforts": {"gpt-6-astra": "xhigh"}}
+    def test_profile_effort_preserves_explicit_empty_value(self):
         body = {
             "model": "gpt-6-astra",
             "messages": [{"role": "user", "content": "Say ok."}],
@@ -816,10 +959,9 @@ class RouterRequestConversionTests(unittest.TestCase):
 
         out = router._apply_configured_reasoning_effort(
             router.chat_to_responses(body),
-            cfg,
-            body["model"],
             "responses",
             source_body=body,
+            profile_effort="xhigh",
         )
 
         self.assertNotIn("reasoning", out)
@@ -1981,6 +2123,105 @@ class ResponsesToChatTests(unittest.TestCase):
 
         self.assertEqual(suffix[0]["choices"][0]["delta"]["reasoning_content"], " Then act.")
 
+    def test_reasoning_terminal_summary_under_a_new_item_id_is_not_repeated(self):
+        """A gateway may re-issue finished reasoning under a fresh item id.
+
+        The per-item bookkeeping cannot see the repeat, so the whole summary
+        would be streamed a second time and the thinking block would show the
+        same text twice.
+        """
+        converter = router.ResponsesToChat("responses-model")
+        converter.on_event({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "item_streamed",
+            "delta": "Think first.",
+        })
+
+        repeated = converter.on_event({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "id": "item_terminal",
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "Think first."}],
+                }],
+            },
+        })
+
+        self.assertEqual(repeated, [])
+
+    def test_pixel_style_reasoning_is_streamed_exactly_once(self):
+        """Reproduce the upstream shape that made the thinking block double."""
+        converter = router.ResponsesToChat("responses-model")
+        summary = "We need answer. 17*23 = 391."
+
+        converter.on_event({
+            "type": "response.output_item.added",
+            "item": {"id": "item_a", "type": "reasoning", "summary": []},
+        })
+        for piece in ("We need answer. ", "17*23 = 391."):
+            converter.on_event({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "item_a",
+                "delta": piece,
+            })
+        converter.on_event({
+            "type": "response.output_item.done",
+            "item": {
+                "id": "item_a",
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": summary}],
+            },
+        })
+        terminal = converter.on_event({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "id": "item_b",
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": summary}],
+                }],
+            },
+        })
+
+        self.assertEqual(terminal, [])
+        emitted = "".join(
+            event["choices"][0]["delta"].get("reasoning_content", "")
+            for event in converter.on_event({"type": "response.created"})
+        )
+        self.assertEqual(emitted, "")
+        self.assertEqual(converter._reasoning_all, summary)
+
+    def test_distinct_reasoning_items_are_both_streamed(self):
+        """Two different reasoning items must not be mistaken for a repeat."""
+        converter = router.ResponsesToChat("responses-model")
+        converter.on_event({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "item_a",
+            "delta": "First thought.",
+        })
+        converter.on_event({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "item_b",
+            "delta": "Second thought.",
+        })
+
+        repeated = converter.on_event({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "id": "item_c",
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "Second thought."}],
+                }],
+            },
+        })
+
+        self.assertEqual(repeated, [])
+
 
 class UpstreamHeaderTests(unittest.TestCase):
     def test_forwards_codex_identity_but_filters_switch_marker(self):
@@ -2014,6 +2255,52 @@ class UpstreamHeaderTests(unittest.TestCase):
         )
 
         self.assertNotIn("User-Agent", headers)
+
+    def test_opencode_maps_native_session_header(self):
+        request = HeaderRequest({"session-id": "codex-session-1"})
+        supplier = {
+            "name": "opencode",
+            "api_key": "upstream-key",
+            "base_url": "https://opencode.ai/zen/go/v1",
+            "forward_client_identity": False,
+        }
+
+        headers = router.upstream_headers(supplier, request)
+
+        self.assertEqual(headers["x-opencode-session"], "codex-session-1")
+        self.assertNotIn("User-Agent", headers)
+
+    def test_opencode_prefers_session_header_and_body_fallback(self):
+        thread_request = HeaderRequest({
+            "session-id": "codex-session-1",
+            "thread-id": "codex-thread-1",
+        })
+        supplier = {
+            "name": "opencode",
+            "api_key": "upstream-key",
+            "base_url": "https://opencode.ai/zen/go/v1",
+        }
+
+        headers = router.upstream_headers(supplier, thread_request)
+        self.assertEqual(headers["x-opencode-session"], "codex-session-1")
+
+        body_request = HeaderRequest({})
+        body = {"client_metadata": {"session_id": "body-session-1"}}
+        headers = router.upstream_headers(supplier, body_request, body)
+        self.assertEqual(headers["x-opencode-session"], "body-session-1")
+
+    def test_non_opencode_does_not_add_opencode_session_header(self):
+        request = HeaderRequest({"session-id": "codex-session-1"})
+        supplier = {
+            "name": "other",
+            "api_key": "upstream-key",
+            "base_url": "https://example.com/v1",
+        }
+
+        headers = router.upstream_headers(supplier, request)
+
+        self.assertNotIn("x-opencode-session", headers)
+
     def test_incomplete_terminal_event_marks_length_finish_reason(self):
         converter = router.ResponsesToChat("responses-model")
         converter.on_event({

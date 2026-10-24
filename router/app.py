@@ -151,6 +151,7 @@ def start_server(port: int):
 def main():
     import router
 
+    router.migrate_config_on_startup()
     cfg = load_config()
     port = load_port(cfg)
 

@@ -8,6 +8,7 @@ router/stats.jsonl
 router/crash.log
 router/update-error.log
 router/*.log
+router/debug_*.jsonl
 
 # Python environments and build output
 router/.venv/

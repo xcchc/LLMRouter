@@ -88,6 +88,8 @@ class NonStreamRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(StaticJsonClient.closed)
         self.assertFalse(json.loads(StaticJsonClient.requests[0].content)["stream"])
         self.assertEqual(records[0]["total_tokens"], 5)
+        # 非流式：首字耗时等于总耗时。
+        self.assertEqual(records[0]["first_token_ms"], records[0]["duration_ms"])
 
     async def test_chat_usage_cache_aliases_are_recorded(self):
         upstream = {

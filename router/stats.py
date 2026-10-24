@@ -2,6 +2,7 @@
 """请求统计：内存记录 + stats.jsonl 持久化"""
 import datetime
 import json
+import re
 import sys
 import threading
 from pathlib import Path
@@ -16,6 +17,14 @@ KEEP_LINES = 50000   # 裁剪后保留的行数
 
 _lock = threading.Lock()
 _records: list = []
+
+
+def _normalize_model_id(row: dict) -> None:
+    """历史记录里的裸模型名统一补成 ``<供应商>/<模型名>``。"""
+    model = str(row.get("model") or "")
+    supplier = str(row.get("supplier") or "")
+    if model and supplier and not model.startswith(supplier + "/"):
+        row["model"] = f"{supplier}/{model}"
 
 
 def load() -> None:
@@ -36,9 +45,12 @@ def load() -> None:
             if not ln:
                 continue
             try:
-                rows.append(json.loads(ln))
+                row = json.loads(ln)
             except Exception:
-                pass
+                continue
+            if isinstance(row, dict):
+                _normalize_model_id(row)
+                rows.append(row)
         _records = rows
     except Exception:
         pass
@@ -56,7 +68,9 @@ def clear() -> None:
 
 def record(req: dict) -> None:
     """记录一次请求。req 字段：ts/model/supplier/upstream_wire/incoming_wire/status/http_status/
-    input_tokens/output_tokens/reasoning_tokens/total_tokens/duration_ms/reasoning_effort/error"""
+    input_tokens/output_tokens/total_tokens/duration_ms/first_token_ms/reasoning_effort/error"""
+    if isinstance(req, dict):
+        _normalize_model_id(req)
     with _lock:
         _records.append(req)
         try:
@@ -86,12 +100,20 @@ def recent_filtered(
     start: float = None,
     end: float = None,
     model: str = "",
+    status: str = "",
 ) -> tuple:
-    """按模型和时间范围过滤最近记录，用于"最近请求"分页。start/end 为 Unix 秒。"""
+    """按模型、状态和时间范围过滤最近记录，用于"最近请求"分页。start/end 为 Unix 秒。
+
+    ``status``：``ok`` 只看成功，``error`` 只看失败（status 不是 ok），空表示全部。
+    """
     with _lock:
         rows = list(_records)
     if model:
         rows = [r for r in rows if (r.get("model") or "?") == model]
+    if status == "ok":
+        rows = [r for r in rows if (r.get("status") or "") == "ok"]
+    elif status:
+        rows = [r for r in rows if (r.get("status") or "") != "ok"]
     if hours and hours > 0:
         cutoff = time_now() - hours * 3600
         rows = [r for r in rows if (r.get("ts") or 0) >= cutoff]
@@ -116,6 +138,28 @@ def _num(v) -> int:
         return 0
 
 
+def _first_token_ms(r: dict):
+    """首字耗时（毫秒）；没有记录时返回 None。"""
+    v = r.get("first_token_ms")
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+        return float(v)
+    return None
+
+
+def _gen_ms(r: dict) -> float:
+    """生成耗时 = 总耗时 − 首字耗时。
+
+    首字之后才是真正的出字阶段，用它当分母算速度更准；非流式请求
+    （首字 = 总耗时）和老记录没有首字数据时退回总耗时，避免分母为 0。
+    """
+    dur = r.get("duration_ms")
+    dur = float(dur) if isinstance(dur, (int, float)) and not isinstance(dur, bool) and dur > 0 else 0.0
+    first = _first_token_ms(r)
+    if first is not None and 0 <= first < dur:
+        return dur - first
+    return dur
+
+
 def _price(v) -> float:
     """价格转浮点（保留小数，如 0.2 元）；非数字返回 0.0。"""
     try:
@@ -130,7 +174,6 @@ def _merge_tokens(agg: dict, r: dict) -> None:
     agg["input"] += _num(r.get("input_tokens"))
     agg["cached"] += _num(r.get("cached_tokens"))
     agg["output"] += _num(r.get("output_tokens"))
-    agg["reasoning"] += _num(r.get("reasoning_tokens"))
     agg["total"] += _num(r.get("total_tokens"))
 
 
@@ -147,12 +190,18 @@ def _cost_of(r: dict, p: dict) -> float:
     return (inp - cached) * in_price / 1e6 + cached * in_cached_price / 1e6 + _num(r.get("output_tokens")) * p.get("out", 0) / 1e6
 
 
+def _model_sort_key(text: str) -> list:
+    """模型名排序键：忽略大小写，数字段按数值比较（gpt-5.9 排在 gpt-5.10 前）。"""
+    parts = re.split(r"(\d+)", str(text or "").casefold())
+    return [(0, int(part)) if part.isdigit() else (1, part) for part in parts]
+
+
 def summary(cfg: dict, model: str = "", hours: int = 24, start: float = None, end: float = None) -> dict:
     """汇总：总量 / 按模型 / 按供应商 / 时间曲线 / 错误数 / 平均耗时 / 缓存命中
     model 非空时只统计该模型；hours>0 时只统计最近 N 小时（0=全部）；start/end 为 Unix 秒。"""
     with _lock:
         rows = list(_records)
-    all_models = sorted({r.get("model") or "?" for r in rows})
+    all_models = sorted({r.get("model") or "?" for r in rows}, key=_model_sort_key)
     if model:
         rows = [r for r in rows if (r.get("model") or "?") == model]
     now_ts = time_now()
@@ -189,8 +238,8 @@ def summary(cfg: dict, model: str = "", hours: int = 24, start: float = None, en
                 "out": None if v.get("price_output_per_1m") in (None, "") else _price(v.get("price_output_per_1m")),
                 "in_cached": None if v.get("price_input_cached_per_1m") in (None, "") else _price(v.get("price_input_cached_per_1m")),
             }
-    total = {"requests": 0, "errors": 0, "failed": 0, "input": 0, "cached": 0, "output": 0, "reasoning": 0, "total": 0, "cost": 0.0}
-    today = {"requests": 0, "errors": 0, "input": 0, "cached": 0, "output": 0, "reasoning": 0, "total": 0}
+    total = {"requests": 0, "errors": 0, "failed": 0, "input": 0, "cached": 0, "output": 0, "total": 0, "cost": 0.0, "ms": 0, "first": 0.0, "first_n": 0}
+    today = {"requests": 0, "errors": 0, "input": 0, "cached": 0, "output": 0, "total": 0, "ms": 0, "first": 0.0, "first_n": 0}
     by_model = {}
     by_supplier = {}
     hourly = {}
@@ -198,23 +247,37 @@ def summary(cfg: dict, model: str = "", hours: int = 24, start: float = None, en
     for r in rows:
         ts = r.get("ts") or 0
         status = r.get("status", "")
+        gen_ms = _gen_ms(r)
+        first_ms = _first_token_ms(r)
         total["requests"] += 1
         if status != "ok":
             total["errors"] += 1
         _merge_tokens(total, r)
+        total["ms"] += gen_ms
+        if first_ms is not None:
+            total["first"] += first_ms
+            total["first_n"] += 1
         if ts >= day_start:
             today["requests"] += 1
             if status != "ok":
                 today["errors"] += 1
             _merge_tokens(today, r)
+            today["ms"] += gen_ms
+            if first_ms is not None:
+                today["first"] += first_ms
+                today["first_n"] += 1
         m = r.get("model") or "?"
         sup = r.get("supplier") or "?"
         for key, bucket in ((m, by_model), (sup, by_supplier)):
-            b = bucket.setdefault(key, {"requests": 0, "errors": 0, "input": 0, "cached": 0, "output": 0, "reasoning": 0, "total": 0, "cost": 0.0})
+            b = bucket.setdefault(key, {"requests": 0, "errors": 0, "input": 0, "cached": 0, "output": 0, "total": 0, "cost": 0.0, "ms": 0, "first": 0.0, "first_n": 0})
             b["requests"] += 1
             if status != "ok":
                 b["errors"] += 1
             _merge_tokens(b, r)
+            b["ms"] += gen_ms
+            if first_ms is not None:
+                b["first"] += first_ms
+                b["first_n"] += 1
             p = dict(prices.get(sup) or {})
             mp = model_prices.get(m)
             if mp:
@@ -299,11 +362,24 @@ def summary(cfg: dict, model: str = "", hours: int = 24, start: float = None, en
             b = hourly.get(key, {"requests": 0, "total": 0})
             buckets.append({"hour": dt.strftime("%m-%d"), "requests": b["requests"], "tokens": b["total"]})
     avg_duration = round(sum(durations) / len(durations), 1) if durations else 0
+
+    def _finish(bucket: dict) -> dict:
+        """补上 token 速度和平均首字。
+
+        速度 = 输出 token 总和 ÷ 生成耗时总和（总耗时减首字），不是对每次请求的速度求平均。
+        """
+        ms = bucket.pop("ms", 0) or 0
+        first = bucket.pop("first", 0.0) or 0.0
+        first_n = bucket.pop("first_n", 0) or 0
+        bucket["speed"] = round(bucket.get("output", 0) / (ms / 1000), 1) if ms > 0 else 0
+        bucket["avg_first_token_ms"] = round(first / first_n, 1) if first_n else 0
+        return bucket
+
     return {
-        "total": total,
-        "today": today,
-        "by_model": [dict(by_model[k], name=k) for k in sorted(by_model)],
-        "by_supplier": [dict(by_supplier[k], name=k) for k in sorted(by_supplier)],
+        "total": _finish(total),
+        "today": _finish(today),
+        "by_model": [_finish(dict(by_model[k], name=k)) for k in sorted(by_model, key=_model_sort_key)],
+        "by_supplier": [_finish(dict(by_supplier[k], name=k)) for k in sorted(by_supplier)],
         "hourly": buckets,
         "avg_duration_ms": avg_duration,
         "avg_duration_seconds": avg_duration / 1000,
