@@ -39,11 +39,13 @@ class ResponsesToChatToolBridgeTests(unittest.IsolatedAsyncioTestCase):
                 "arguments": "",
             },
         })
-        chunks += converter.on_event({
+        deltas = converter.on_event({
             "type": "response.function_call_arguments.delta",
             "item_id": "fc_thread",
             "delta": '{"threadId":"thread_1"}',
         })
+        # 参数先攒着：确认完整（done/终止事件）之后才一次性下发。
+        self.assertEqual(tool_calls_from(deltas), [])
         duplicate = converter.on_event({
             "type": "response.completed",
             "response": {
@@ -59,11 +61,11 @@ class ResponsesToChatToolBridgeTests(unittest.IsolatedAsyncioTestCase):
             },
         })
 
-        calls = tool_calls_from(chunks)
+        calls = tool_calls_from(chunks + duplicate)
         self.assertEqual(calls[0]["id"], "call_thread")
         self.assertEqual(calls[0]["function"]["name"], "codex_app__read_thread")
         self.assertEqual(calls[1]["function"]["arguments"], '{"threadId":"thread_1"}')
-        self.assertEqual(tool_calls_from(duplicate), [])
+        self.assertEqual(len(calls), 2)
         self.assertEqual(converter.final_chunk()["choices"][0]["finish_reason"], "tool_calls")
 
     def test_custom_tool_call_waits_for_complete_input_and_wraps_it(self):

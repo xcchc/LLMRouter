@@ -1133,6 +1133,13 @@ def chat_to_responses(body: dict) -> dict:
                     "type": "reasoning",
                     "summary": [{"type": "summary_text", "text": reasoning_text}],
                 })
+            # 正文必须排在 function_call 之前。Responses 历史里一条 assistant 的输出项
+            # 顺序是 reasoning -> message -> function_call；把正文塞在 function_call
+            # 与 function_call_output 之间，严格校验的上游（pixel 的 /v1/responses）
+            # 会判定 "tool calls and tool results do not match"（code 11148）。
+            content = _chat_content_to_responses(m.get("content"), assistant=True)
+            if content:
+                items.append({"type": "message", "role": "assistant", "content": content})
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function", {})
                 args = fn.get("arguments")
@@ -1145,9 +1152,6 @@ def chat_to_responses(body: dict) -> dict:
                     "name": fn.get("name", ""),
                     "arguments": args,
                 })
-            content = _chat_content_to_responses(m.get("content"), assistant=True)
-            if content:
-                items.append({"type": "message", "role": "assistant", "content": content})
             continue
         content = _chat_content_to_responses(m.get("content"), assistant=False)
         if content:
@@ -1193,15 +1197,223 @@ def chat_to_responses(body: dict) -> dict:
         resp["text"] = {"format": text_format}
     return resp
 
+# ------------------ 悬空工具调用补齐 ------------------
+#
+# 一轮任务被 max-tokens / 上游断流打断时，客户端历史里会留下"有 tool_call、
+# 没有对应 tool_result"的残缺结构。上游对此一律拒绝：
+#   chat   : "assistant message before pending tool results" (400)
+#   responses: "tool calls and tool results do not match" (code 11148)
+# 一旦出现，这个会话后续每次请求都会 400，只能新开——用户看到的就是"突然断了，
+# 继续也没用"。这里在转发前给缺失的结果补一条占位说明，把历史修成上游能接受
+# 的结构，让会话能继续下去。
+
+DANGLING_TOOL_PLACEHOLDER = (
+    "[local router] This tool call was interrupted before it produced a result. "
+    "Treat it as having returned nothing and continue with the task."
+)
+
+_RESPONSES_CALL_OUTPUT_TYPES = {
+    "function_call": "function_call_output",
+    "custom_tool_call": "custom_tool_call_output",
+    "tool_search_call": "tool_search_output",
+}
+_RESPONSES_OUTPUT_TYPES = frozenset(_RESPONSES_CALL_OUTPUT_TYPES.values())
+
+
+def _should_repair_tool_calls(supplier: dict) -> bool:
+    """是否补齐悬空工具调用（供应商可用 ``repair_tool_calls: false`` 关掉）。"""
+    configured = supplier.get("repair_tool_calls")
+    return bool(configured) if isinstance(configured, bool) else True
+
+
+def _repair_responses_tool_calls(body: dict) -> int:
+    """Responses 请求体：补悬空调用，删掉没有对应调用的孤儿结果。
+
+    上游对这两种错配一律拒绝（pixel 返回 ``tool_call_mismatch`` / 11148），
+    而且一次错配就让整段会话作废，所以转发前先修成上游能接受的结构。
+    """
+    items = body.get("input")
+    if not isinstance(items, list) or not items:
+        return 0
+
+    calls = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in _RESPONSES_CALL_OUTPUT_TYPES:
+            call_id = item.get("call_id") or item.get("id")
+            if isinstance(call_id, str) and call_id:
+                calls.setdefault(call_id, item_type)
+
+    # 先删"有结果、没调用"的孤儿项：上游同样视为错配。
+    kept = []
+    orphans = 0
+    for item in items:
+        if isinstance(item, dict) and item.get("type") in _RESPONSES_OUTPUT_TYPES:
+            call_id = item.get("call_id")
+            if isinstance(call_id, str) and call_id and call_id not in calls:
+                orphans += 1
+                continue
+        kept.append(item)
+    if orphans:
+        items = body["input"] = kept
+
+    if not calls:
+        return orphans
+
+    answered = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in _RESPONSES_OUTPUT_TYPES:
+            call_id = item.get("call_id")
+            if isinstance(call_id, str) and call_id:
+                answered.add(call_id)
+
+    pending = {cid: kind for cid, kind in calls.items() if cid not in answered}
+    if not pending:
+        return orphans
+
+    repaired = []
+    filled = 0
+    for item in items:
+        repaired.append(item)
+        if not isinstance(item, dict):
+            continue
+        call_id = item.get("call_id") or item.get("id")
+        kind = pending.get(call_id) if isinstance(call_id, str) else None
+        if kind:
+            repaired.append({
+                "type": _RESPONSES_CALL_OUTPUT_TYPES[kind],
+                "call_id": call_id,
+                "output": DANGLING_TOOL_PLACEHOLDER,
+            })
+            pending.pop(call_id, None)
+            filled += 1
+    if filled:
+        body["input"] = repaired
+    return filled + orphans
+
+
+def _repair_chat_tool_calls(body: dict) -> int:
+    """Chat 请求体：补悬空调用的占位结果，并删掉无对应调用的孤儿结果。"""
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return 0
+
+    known = set()
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            if isinstance(call, dict) and isinstance(call.get("id"), str) and call.get("id"):
+                known.add(call["id"])
+
+    dropped = 0
+    filtered = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "tool":
+            call_id = message.get("tool_call_id")
+            # 结果找不到对应调用（或根本没有 id）时上游一律 400，直接删掉。
+            if not (isinstance(call_id, str) and call_id and call_id in known):
+                dropped += 1
+                continue
+        filtered.append(message)
+    if dropped:
+        messages = body["messages"] = filtered
+
+    repaired = []
+    filled = 0
+    index = 0
+    total = len(messages)
+    while index < total:
+        message = messages[index]
+        repaired.append(message)
+        index += 1
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "assistant":
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            continue
+
+        call_ids = [
+            call.get("id")
+            for call in tool_calls
+            if isinstance(call, dict) and isinstance(call.get("id"), str) and call.get("id")
+        ]
+        if not call_ids:
+            continue
+
+        answered = set()
+        while index < total:
+            follower = messages[index]
+            if not (isinstance(follower, dict) and follower.get("role") == "tool"):
+                break
+            repaired.append(follower)
+            answered.add(follower.get("tool_call_id"))
+            index += 1
+
+        for call_id in call_ids:
+            if call_id in answered:
+                continue
+            repaired.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": DANGLING_TOOL_PLACEHOLDER,
+            })
+            filled += 1
+
+    if filled:
+        body["messages"] = repaired
+    return filled + dropped
+
+
+def repair_dangling_tool_calls(body: dict, wire: str) -> int:
+    """按上游线协议补齐悬空工具调用，返回补了几条。"""
+    if not isinstance(body, dict):
+        return 0
+    if wire == "chat":
+        return _repair_chat_tool_calls(body)
+    return _repair_responses_tool_calls(body)
+
+
 # ------------------ SSE 解析 ------------------
 
 def sse_bytes(obj) -> bytes:
     return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n\n"
 
 
+def _tidy_upstream_error_text(text) -> str:
+    """把上游层层转义的错误文本拆成一条人能看懂的消息。
+
+    上游错误经常被包成 ``{"error":{"message":"{\\"error\\":{...}}"}}``，原样
+    转发出去客户端只能看到一坨转义 JSON，看不到真正的失败原因。
+    """
+    text = str(text or "").strip()
+    for _ in range(4):
+        try:
+            obj = json.loads(text)
+        except Exception:
+            return text
+        if not isinstance(obj, dict):
+            return text
+        inner = obj.get("error") if isinstance(obj.get("error"), dict) else obj
+        message = inner.get("message") or inner.get("msg")
+        if not message:
+            return text
+        text = str(message).strip()
+        code = inner.get("code")
+        if code and str(code) not in text:
+            text = f"{text}（upstream code {code}）"
+    return text
+
+
 def upstream_stream_failure_event(incoming_wire: str, model: str, message: str) -> bytes:
     """Build a terminal SSE frame after an upstream stream breaks."""
-    message = str(message)[:500]
+    message = _tidy_upstream_error_text(message)[:500]
     if incoming_wire == "responses":
         return sse_bytes({
             "type": "response.failed",
@@ -1353,6 +1565,9 @@ class UsageSniffer:
             if not isinstance(obj, dict):
                 continue
             terminal_type = obj.get("type")
+            if isinstance(obj.get("error"), dict) and terminal_type not in ("response.completed", "response.incomplete"):
+                # 中转层自己合成的错误帧：本轮实际失败了，统计里要看得见。
+                self.status = "error"
             if terminal_type in ("response.completed", "response.failed", "response.incomplete"):
                 self.saw_terminal = True
             if terminal_type == "response.failed":
@@ -1366,6 +1581,163 @@ class UsageSniffer:
                 u = obj["response"].get("usage")
             if isinstance(u, dict) and (u.get("total_tokens") is not None or u.get("input_tokens") is not None or u.get("prompt_tokens") is not None):
                 self.usage = u
+
+
+# ------------------ 畸形协议标记清洗 ------------------
+#
+# 有些上游模型（实测 pixel/deepseek-v4.1-flash）在把工具调用吐成文本时，
+# 会把训练期的特殊标记和控制串一起写进正文，例如：
+#   ="{" command":"ok">Let me just call the tool properly.</thinking>
+#   ｜DSML｜ calls>
+#   <｜begin▁of▁sentence｜>var">I made another malformed call.
+# 这些片段既不是回答也不是工具调用，却会污染 assistant 正文：客户端把它当
+# 正常回复渲染，收起工作步骤后仍然挂在界面上（Dsh 的 keepReplies=all），
+# 看起来就像"思考链没有折叠"。所以在转发前就地剥掉。
+
+# 特殊标记：<｜begin▁of▁sentence｜> 这类 token 用全角竖线包裹，必须单独匹配。
+_SPECIAL_TOKEN_RE = re.compile(r"<[｜|][^<>\n]{0,40}?[｜|]>?")
+# 明确的协议标记按名字匹配，避免误伤普通文本。
+_PROTOCOL_TOKEN_RE = re.compile(
+    r"[<｜|]{1,2}\s*"
+    r"(?:begin|end)[▁_]{1,3}of[▁_]{1,3}(?:sentence|text)"
+    r"\s*[｜|]?>{0,2}"
+    r"|[<｜|]{1,2}\s*DSML\s*[｜|]?\s*(?:calls?|invokes?|invoke|tool[▁_]?calls?)?\s*>{0,2}",
+    re.IGNORECASE,
+)
+# 常见的"半截"残留：泄露的收尾标签与调用片段。
+_PROTOCOL_FRAGMENT_RES = (
+    re.compile(r"</?thinking>", re.IGNORECASE),
+    re.compile(r"</?(?:tool_call|function_call|antml:invoke|antml:parameter)[^>]{0,40}>", re.IGNORECASE),
+    # 以 = 或 " 开头、紧跟 JSON 键、然后被 > 截断的调用残骸。
+    re.compile(r'^[\s`]*=\s*"\{.*?>\s*'),
+    re.compile(r'^\s*"\s*command\s*"\s*:\s*">\s*'),
+    # 标记剥完后剩下的空壳引号/箭头碎片。
+    re.compile(r'^[\s"]*(?:command|arguments|calls?)\s*"\s*:\s*">\s*', re.IGNORECASE),
+)
+# 标记被剥掉之后紧跟的孤儿碎片，例如 "<｜begin▁of▁sentence｜>var\">" 里的 var">。
+_ORPHAN_STUB_RE = re.compile(r'^\s*[A-Za-z_]{1,12}"\s*>\s*')
+# 被流切开的孤儿碎片（可能只到 var" 或 var 为止）。
+_ORPHAN_STUB_PARTIAL_RE = re.compile(r'^[A-Za-z_]{1,12}"?>?$')
+# 只在"回复开头"才用的规则：模型偶尔把 @@ 之类当控制前缀吐出来。
+_HEAD_ONLY_RES = (re.compile(r"^@@+\s*"),)
+# 流首暂存：只有这些"确凿的调用残骸开头"才值得等后续 chunk，避免正常
+# 回复（以 = 或引号开头）被卡住。
+_HEAD_HINT_RE = re.compile(
+    r'^[\s`]*=\s*"\{'
+    r'|^\s*"\s*(?:command|arguments|calls?)\s*"'
+    r'|^\s*(?:command|arguments|calls?)\s*"?\s*>',
+    re.IGNORECASE,
+)
+# 流式判断：缓冲区尾部是否停在一个还没写完的标记上。
+_MARKER_OPEN_RE = re.compile(r"<(?![^<>\n]*>)|｜(?![^<>\n]*>)")
+
+
+def _strip_protocol_markup(text: str, at_start: bool = True) -> str:
+    """剥掉正文里的特殊标记和泄露的调用残骸，保留正常内容。
+
+    只在"这一段本身就是标记"时才整段丢弃；混合正文只删除标记本身，
+    避免把真正的回答一起吃掉。``at_start`` 表示这仍是本段回答的开头，
+    此时才应用锚定在开头的残骸规则。
+    """
+    if not text:
+        return text
+    cleaned = _PROTOCOL_TOKEN_RE.sub("", text)
+    cleaned = _SPECIAL_TOKEN_RE.sub("", cleaned)
+    cleaned = re.sub(r"</?thinking>", "", cleaned, flags=re.IGNORECASE)
+    if not at_start:
+        return cleaned
+    # 开头的残骸可能被裁成多段，反复剥到稳定为止。
+    while True:
+        before = cleaned
+        for pattern in _PROTOCOL_FRAGMENT_RES:
+            cleaned = pattern.sub("", cleaned)
+        cleaned = _ORPHAN_STUB_RE.sub("", cleaned)
+        for pattern in _HEAD_ONLY_RES:
+            cleaned = pattern.sub("", cleaned)
+        if cleaned == before:
+            return cleaned
+
+
+class _MarkupScrubber:
+    """流式清洗：跨 chunk 被切断的标记要拼起来再判断。
+
+    只暂存两类内容：尾部"没写完的标记"，以及回答最开头疑似调用残骸的
+    前缀。其余内容立刻放行，正常文本不会因此多等。
+    """
+
+    _MAX_HOLD = 96
+    # 只有离结尾这么近的标记起点才可能是被切断的，避免误存整段正文。
+    _HOLD_WINDOW = 33
+
+    def __init__(self):
+        self._pending = ""
+        self._emitted = ""
+        # 上一块结尾刚剥掉标记时，紧跟的孤儿碎片可能被切到下一块。
+        self._after_marker = False
+
+    @property
+    def _at_start(self) -> bool:
+        return not self._emitted.strip()
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        buf = self._pending + text
+        self._pending = ""
+        # 回答开头：残骸可能还没写完，等它出现 > 或换行再判定。
+        if self._at_start and self._head_unsettled(buf):
+            self._pending = buf[: self._MAX_HOLD]
+            return ""
+        # 刚剥过标记：孤儿碎片可能还没写完，留着等下一块。
+        if self._after_marker and _ORPHAN_STUB_PARTIAL_RE.match(buf) and len(buf) < 16:
+            self._pending = buf
+            return ""
+        hold = self._marker_tail_start(buf)
+        if hold is not None:
+            self._pending = buf[hold:]
+            buf = buf[:hold]
+        at_start = self._at_start
+        out = _strip_protocol_markup(buf, at_start=at_start)
+        if out != buf:
+            # 这一段剥掉过标记，后面紧跟的碎片也要跟着剥。
+            out = _ORPHAN_STUB_RE.sub("", out)
+        self._after_marker = out != buf and not out.strip()
+        self._emitted += out
+        return out
+
+    @classmethod
+    def _head_unsettled(cls, buf: str) -> bool:
+        """回答开头看起来像残骸、但还没看到终止符时，先攒着。"""
+        if len(buf) > cls._MAX_HOLD:
+            return False
+        head = buf.lstrip()
+        if not head:
+            return True
+        if not (_HEAD_HINT_RE.match(head) or head[0] in "<｜|"):
+            return False
+        if head[0] in "<｜|":
+            # 特殊标记自带 -> 包裹，没闭合就还得等。
+            return _MARKER_OPEN_RE.search(buf) is not None
+        return ">" not in buf and "\n" not in buf
+
+    @classmethod
+    def _marker_tail_start(cls, buf: str):
+        """返回应当暂存的尾部起点；``None`` 表示全部可以放行。"""
+        window_start = max(0, len(buf) - cls._HOLD_WINDOW)
+        match = _MARKER_OPEN_RE.search(buf, window_start)
+        if match is None:
+            return None
+        start = match.start()
+        # 暂存长度受 _MAX_HOLD 约束，超长的说明不是标记。
+        if len(buf) - start > cls._MAX_HOLD:
+            return None
+        return start
+
+    def flush(self) -> str:
+        tail, self._pending = self._pending, ""
+        out = _strip_protocol_markup(tail, at_start=self._at_start)
+        self._emitted += out
+        return out
 
 
 # ------------------ Chat -> Responses 转换 ------------------
@@ -1392,6 +1764,8 @@ class ChatToResponses:
         self.usage = None
         self.finish_reason = None
         self.upstream_error = None
+        # 正文里的畸形协议标记就地剥掉，别让它变成客户端可见的"回复"。
+        self._text_scrubber = _MarkupScrubber()
 
     def created_event(self) -> dict:
         return {
@@ -1581,6 +1955,8 @@ class ChatToResponses:
             })
         content = self._normalize_text_chunk(payload.get("content"))
         if content:
+            content = self._text_scrubber.feed(content)
+        if content:
             self.msg_text.append(content)
             if self.msg_started:
                 events.append({
@@ -1647,6 +2023,20 @@ class ChatToResponses:
 
     def final_events(self) -> list:
         events = []
+        # 流结束时把清洗器里挂着的尾巴放出来（可能是半个标记，剥完可能是空串）。
+        tail = self._text_scrubber.flush()
+        if tail:
+            self.msg_text.append(tail)
+            if self.msg_started:
+                # 正文已经开始下发：尾巴也要按 delta 补发，否则只出现在
+                # output_text.done 里会被只认 delta 的客户端丢掉。
+                events.append({
+                    "type": "response.output_text.delta",
+                    "item_id": self.msg_id,
+                    "output_index": self._item_index(self.msg_id),
+                    "content_index": 0,
+                    "delta": tail,
+                })
         if self.msg_text and not self.msg_started:
             phase = "commentary" if self.has_tool_calls or self.finish_reason == "tool_calls" else "final_answer"
             events.extend(self._start_message(phase))
@@ -1858,6 +2248,24 @@ class ChatToResponses:
 
 # ------------------ Responses -> Chat 转换 ------------------
 
+def _is_complete_json(text) -> bool:
+    """工具参数是否已经是一段完整的 JSON。
+
+    上游把流截断时，``function_call`` 的增量会停在一句半中间；这种参数绝不能
+    转发给客户端，否则客户端会解析失败并把整轮任务打断。
+    """
+    if not isinstance(text, str):
+        return False
+    text = text.strip()
+    if not text:
+        return False
+    try:
+        json.loads(text)
+    except Exception:
+        return False
+    return True
+
+
 class ResponsesToChat:
     """把上游 Responses 响应（SSE 或 JSON）转换为 Chat Completions SSE 块。"""
 
@@ -1873,6 +2281,14 @@ class ResponsesToChat:
         self.status = "completed"
         self._reasoning_parts = {}
         self._reasoning_all = ""
+        # 上游是否给出了终止事件（completed/incomplete/failed）。没有它就是被截断
+        # 的流：usage 不会下发，工具参数也可能停在半句上。
+        self.terminal_seen = False
+        # 已经流给客户端的正文，用来识别"上游把 reasoning 复读成正文"。
+        self._text_all = ""
+        self.reasoning_echo = False
+        # 正文里的畸形协议标记就地剥掉（与 ChatToResponses 同一套规则）。
+        self._text_scrubber = _MarkupScrubber()
 
     @staticmethod
     def _chunk(delta: dict, finish_reason=None) -> dict:
@@ -1916,6 +2332,10 @@ class ResponsesToChat:
             "argument_parts": [],
             "custom_input_parts": [],
             "arguments_sent": False,
+            # 已按增量收到但还没下发；下发前必须确认是完整 JSON。
+            "arguments_streamed": False,
+            # 终止事件里带的完整参数（上游有时只在收尾处给全量）。
+            "final_arguments": None,
         }
         self.tool_records.append(rec)
         if item_id:
@@ -1947,6 +2367,34 @@ class ResponsesToChat:
         rec["arguments_sent"] = True
         rec["argument_parts"].append(arguments)
 
+    def _collected_arguments(self, rec: dict):
+        """返回 ``(可下发的参数, 是否被截断)``。
+
+        ``final_arguments`` 优先（终止事件给的是全量），其次才用流式累计值；
+        两者都拼不成 JSON 时判定为截断，交给收尾逻辑换成一个明确的错误帧。
+        """
+        final_args = rec.get("final_arguments")
+        streamed = "".join(rec.get("argument_parts") or [])
+        if isinstance(final_args, str) and not final_args.strip() and not streamed:
+            # 无参工具：上游给的本来就是空串，不算截断。
+            return None, False
+        if final_args is not None and _is_complete_json(final_args):
+            return final_args, False
+        if streamed and _is_complete_json(streamed):
+            return streamed, False
+        if streamed or final_args is not None:
+            return None, True
+        return None, False
+
+    def _emit_collected_arguments(self, rec: dict, events: list) -> None:
+        if rec.get("arguments_sent"):
+            return
+        if rec.get("type") != "function_call":
+            return
+        arguments, broken = self._collected_arguments(rec)
+        if arguments is not None and not broken:
+            self._emit_arguments(rec, arguments, events)
+
     def _emit_item_arguments(self, rec: dict, item: dict, events: list, final=False) -> None:
         if rec.get("arguments_sent"):
             return
@@ -1962,9 +2410,12 @@ class ResponsesToChat:
             if arguments is not None and (arguments or final):
                 self._emit_arguments(rec, _args_to_string(arguments), events)
         else:
-            arguments = item.get("arguments")
-            if arguments is not None and (arguments or final):
-                self._emit_arguments(rec, _args_to_string(arguments), events)
+            if isinstance(item, dict) and item.get("arguments") is not None:
+                rec["final_arguments"] = _args_to_string(item.get("arguments"))
+            if not final:
+                # 参数先攒着：确认是完整 JSON 之后再一次性下发，半截的不落地。
+                return
+            self._emit_collected_arguments(rec, events)
 
     def _handle_tool_item(self, item: dict, events: list, final=False) -> None:
         rec = self._register_tool(item, events)
@@ -2042,9 +2493,17 @@ class ResponsesToChat:
                 self._reasoning_all += d
         elif t == "response.output_text.delta":
             d = evt.get("delta", "")
+            if d and self._is_reasoning_echo(d):
+                # 上游把 reasoning_content 灌进 content 兜底（正文为空时），
+                # 整段思考会被客户端当成回答显示。丢掉它并标记，收尾时报错。
+                self.reasoning_echo = True
+                return events
+            if d:
+                d = self._text_scrubber.feed(d)
             if d:
                 self._ensure_role(events)
                 events.append(self._chunk({"content": d}))
+                self._text_all += d
         elif t == "response.function_call_arguments.delta":
             d = evt.get("delta", "")
             if d:
@@ -2052,14 +2511,18 @@ class ResponsesToChat:
                 rec = self._find_tool(item_id=item_id)
                 idx = rec["index"] if rec is not None else self.fc_index.get(item_id, 0)
                 self.has_tool_calls = True
-                events.append(self._chunk({"tool_calls": [{"index": idx, "function": {"arguments": d}}]}))
                 if rec is not None:
-                    rec["arguments_sent"] = True
+                    # 先攒着，等 done/终止事件确认参数完整后再一次性下发。
                     rec["argument_parts"].append(d)
+                    rec["arguments_streamed"] = True
+                else:
+                    events.append(self._chunk({"tool_calls": [{"index": idx, "function": {"arguments": d}}]}))
         elif t == "response.function_call_arguments.done":
             rec = self._find_tool(item_id=evt.get("item_id", ""))
             if rec is not None and not rec.get("arguments_sent"):
-                self._emit_arguments(rec, _args_to_string(evt.get("arguments", "")), events)
+                if evt.get("arguments") is not None:
+                    rec["final_arguments"] = _args_to_string(evt.get("arguments"))
+                self._emit_collected_arguments(rec, events)
         elif t == "response.custom_tool_call_input.delta":
             rec = self._find_tool(item_id=evt.get("item_id", ""))
             if rec is not None:
@@ -2073,6 +2536,7 @@ class ResponsesToChat:
                 self._emit_arguments(rec, _custom_tool_arguments(tool_input), events)
         elif t in ("response.completed", "response.incomplete"):
             resp_obj = evt.get("response") or {}
+            self.terminal_seen = True
             self.status = resp_obj.get("status", "incomplete" if t == "response.incomplete" else "completed")
             self.usage = resp_obj.get("usage")
             for item in resp_obj.get("output") or []:
@@ -2085,9 +2549,28 @@ class ResponsesToChat:
                         )
                     else:
                         self._handle_tool_item(item, events, final=True)
+            # 终止事件里没带到的调用（例如只流了增量）在这里补发完整参数。
+            for rec in self.tool_records:
+                if not rec.get("arguments_sent"):
+                    self._emit_collected_arguments(rec, events)
         elif t == "response.failed":
+            self.terminal_seen = True
             self.status = "failed"
         return events
+
+    def _is_reasoning_echo(self, delta: str) -> bool:
+        """这一块正文是否就是已经流出去的思考原样复读。
+
+        像素上游在模型只产出 thinking、正文为空时，会把 ``reasoning_content``
+        塞进 ``content`` 兜底：一个完整的 ``output_text.delta`` 落在结束前一瞬，
+        内容与已流出的思考逐字相同。这种正文会被客户端当成最终回答显示。
+        """
+        if self._text_all:
+            return False
+        reasoning = self._reasoning_all.strip()
+        if not reasoning:
+            return False
+        return delta.strip() == reasoning
 
     def _synthesize(self, response: dict) -> list:
         """非流式上游 JSON -> 合成事件序列"""
@@ -2156,6 +2639,45 @@ class ResponsesToChat:
         return chunk
 
     @staticmethod
+    def _error_chunk(message: str) -> dict:
+        """Chat Completions 错误帧：客户端据此报错，而不是收到半截工具调用。"""
+        return {
+            "error": {
+                "code": "upstream_stream_error",
+                "type": "upstream_stream_error",
+                "message": message,
+            }
+        }
+
+    def finish_events(self) -> list:
+        """流结束时的收尾事件。
+
+        上游没有给出终止事件、且工具参数停在半句时，宁可发一条明确的错误帧，
+        也不要把半截 JSON 当成成功结果交给客户端执行。
+        """
+        broken = [
+            rec for rec in self.tool_records
+            if not rec.get("arguments_sent") and self._collected_arguments(rec)[1]
+        ]
+        if broken:
+            self.status = "failed"
+            return [self._error_chunk(
+                "上游在工具调用参数写完前中断了流（没有 response.completed），"
+                "本次工具调用已丢弃，请直接重试。"
+            )]
+        if self.reasoning_echo and not self._text_all:
+            self.status = "failed"
+            return [self._error_chunk(
+                "上游只返回了思考内容（reasoning），没有正文；请重试。"
+            )]
+        events = []
+        for rec in self.tool_records:
+            if not rec.get("arguments_sent"):
+                self._emit_collected_arguments(rec, events)
+        events.append(self.final_chunk())
+        return events
+
+    @staticmethod
     def _map_usage(u) -> dict:
         return {
             "prompt_tokens": u.get("input_tokens", 0),
@@ -2178,7 +2700,16 @@ class ResponsesToChat:
                     evts = self.on_event(evt)
                 for c in evts:
                     yield c
-        yield self.final_chunk()
+        # 流结束时把清洗器里挂着的尾巴补发出去。
+        tail = self._text_scrubber.flush()
+        if tail:
+            tail_events = []
+            self._ensure_role(tail_events)
+            tail_events.append(self._chunk({"content": tail}))
+            for c in tail_events:
+                yield c
+        for c in self.finish_events():
+            yield c
 
 # ------------------ 转发主逻辑 ------------------
 
@@ -2509,7 +3040,7 @@ def _responses_json_to_chat_json(payload: dict, model: str) -> dict:
 
     message = {
         "role": "assistant",
-        "content": "".join(text_parts) if text_parts else (None if tool_calls else ""),
+        "content": _strip_protocol_markup("".join(text_parts)) if text_parts else (None if tool_calls else ""),
     }
     if reasoning_parts:
         reasoning = "\n".join(reasoning_parts)
@@ -2831,6 +3362,179 @@ async def _iter_chat_chunks_for_anthropic(resp: httpx.Response):
             yield evt
 
 
+# --- 上游"早失败"探测 ------------------------------------------------------
+# 上游可能先回 200，再在事件流里塞一个 error 帧（例如中转网关的
+# "Upstream service temporarily unavailable"），或者干脆在吐出任何内容前断流
+# （IncompleteRead）。这类失败发生时客户端还没收到一个字节，整条请求可以安全
+# 重发；不重发的话，客户端只会看到一次莫名其妙的中断。
+#
+# 探测只缓存流开头的一小段字节：心跳照常转发，一旦出现内容帧立刻放行，所以
+# 正常请求不会因此多等一个字节。只有"确认失败"才重发。
+EARLY_STREAM_MAX_RETRIES = 2
+EARLY_STREAM_RETRY_BACKOFF = 0.5
+EARLY_STREAM_PROBE_SECONDS = 180.0
+EARLY_STREAM_PROBE_BYTES = 256 * 1024
+
+# responses 事件里这些只是开场白，不代表模型已经开始产出内容。
+_RESPONSES_PREAMBLE_EVENTS = frozenset({
+    "response.created",
+    "response.in_progress",
+    "response.queued",
+    "response.output_item.added",
+    "response.content_part.added",
+})
+
+
+def _early_stream_retry_budget(supplier: dict) -> int:
+    """每个供应商可以重发的次数（默认 2，即最多尝试 3 次）。"""
+    raw = supplier.get("early_stream_retries", EARLY_STREAM_MAX_RETRIES)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return EARLY_STREAM_MAX_RETRIES
+    return max(0, min(value, 5))
+
+
+def _complete_sse_payloads(buf: bytes):
+    """取出缓冲区里已经收全的 data: 负载；尾部不完整的行留到下一次。"""
+    for line in buf.split(b"\n")[:-1]:
+        line = line.strip()
+        if not line or line.startswith(b":"):
+            continue
+        if line.startswith(b"data:"):
+            yield line[5:].strip()
+
+
+def _stream_event_has_content(obj: dict, wire: str) -> bool:
+    """这一帧是否代表上游已经开始产出内容（拿到就可以停止探测）。"""
+    if wire == "responses":
+        evt = obj.get("type")
+        return (
+            isinstance(evt, str)
+            and evt.startswith("response.")
+            and evt not in _RESPONSES_PREAMBLE_EVENTS
+        )
+    if obj.get("usage"):
+        # 带用量的帧说明这次请求已经跑完了，即使没有正文也不算"早失败"。
+        return True
+    choices = obj.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            if choice.get("finish_reason"):
+                return True
+            delta = choice.get("delta")
+            if isinstance(delta, dict) and any(
+                delta.get(key)
+                for key in (
+                    "content",
+                    "reasoning_content",
+                    "reasoning",
+                    "tool_calls",
+                    "function_call",
+                )
+            ):
+                return True
+    return False
+
+
+def _event_error_text(obj: dict) -> str:
+    error = obj.get("error")
+    if isinstance(error, str) and error.strip():
+        return error.strip()
+    if isinstance(error, dict):
+        for key in ("message", "msg", "detail", "code", "type"):
+            value = error.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    response = obj.get("response")
+    if isinstance(response, dict):
+        return _event_error_text(response)
+    return ""
+
+
+def _stream_head_verdict(buf: bytes, wire: str) -> str:
+    """判定流开头：content 已产出内容 / error 上游报错 / pending 继续等。"""
+    for payload in _complete_sse_payloads(buf):
+        if payload == b"[DONE]":
+            # 正常收尾（哪怕内容为空）不算失败，避免对合法空响应反复重发。
+            return "content"
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("error") or obj.get("type") in ("error", "response.failed"):
+            return "error"
+        if _stream_event_has_content(obj, wire):
+            return "content"
+    return "pending"
+
+
+def _stream_head_error_text(buf: bytes) -> str:
+    for payload in _complete_sse_payloads(buf):
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            text = _event_error_text(obj)
+            if text:
+                return text
+    return ""
+
+
+class _StreamHeadProbe:
+    """缓存上游流开头，判断上游是否"还没产出内容就失败了"。"""
+
+    def __init__(self, wire: str):
+        self.wire = wire
+        self.pending = bytearray()
+        self.committed = False
+        self.error = None
+
+    def feed(self, chunk: bytes) -> bool:
+        """喂入原始字节；返回 True 表示探测结束。"""
+        self.pending += chunk
+        verdict = _stream_head_verdict(bytes(self.pending), self.wire)
+        if verdict == "error":
+            self.error = _stream_head_error_text(bytes(self.pending)) or "上游返回了错误事件"
+            return True
+        if verdict == "content" or len(self.pending) >= EARLY_STREAM_PROBE_BYTES:
+            self.committed = True
+            return True
+        return False
+
+    def commit(self) -> None:
+        """放弃探测（上游只是慢），按正常流转发。"""
+        self.committed = True
+
+
+class _PrefixedResponse:
+    """把探测阶段缓存的字节接回流里，同时保证底层只有一条迭代器。"""
+
+    def __init__(self, response, prefix: bytes, stream):
+        self._response = response
+        self._prefix = prefix
+        self._stream = stream
+
+    async def aiter_bytes(self):
+        if self._prefix:
+            prefix, self._prefix = self._prefix, b""
+            yield prefix
+        while True:
+            try:
+                item = await self._stream.__anext__()
+            except StopAsyncIteration:
+                return
+            yield b": keep-alive\n\n" if item is SSE_HEARTBEAT else item
+
+    def __getattr__(self, name):
+        return getattr(self._response, name)
+
+
 class _FirstChunkTimer:
     """包装上游响应，记录第一个数据块到达的耗时（首字）。"""
 
@@ -2934,6 +3638,15 @@ async def relay(request: Request, incoming_wire: str):
     if not _should_forward_prompt_cache_key(supplier):
         out_body = _strip_prompt_cache_key(out_body)
 
+    # 被 max-tokens / 断流打断的轮次会留下悬空工具调用，上游一律 400 拒绝。
+    # 在发给上游之前补占位结果，避免整段会话作废。
+    repaired_tool_calls = 0
+    if _should_repair_tool_calls(supplier):
+        try:
+            repaired_tool_calls = repair_dangling_tool_calls(out_body, upstream_wire)
+        except Exception:
+            repaired_tool_calls = 0
+
     try:
         await vision.apply_image_policy(out_body, supplier, cfg, upstream_model)
     except Exception:
@@ -2961,6 +3674,7 @@ async def relay(request: Request, incoming_wire: str):
         "reasoning_effort": _reasoning_effort_value(body) or _reasoning_effort_value(out_body),
         "error": None,
         "retry_count": 0,
+        "repaired_tool_calls": repaired_tool_calls,
     }
     start_mono = time.monotonic()
 
@@ -3128,22 +3842,89 @@ async def relay(request: Request, incoming_wire: str):
 
     sniffer = UsageSniffer()
     anth_conv = None
+    # 只有 SSE 才需要探测；上游直接回整段 JSON 时保持原来的透传行为。
+    probe_stream = "text/event-stream" in (resp.headers.get("content-type") or "")
+    early_retry_budget = _early_stream_retry_budget(supplier)
 
     async def gen():
-        nonlocal anth_conv
+        nonlocal anth_conv, resp
+        guarded = None
+        early_error = None
+        attempt = 0
+        iterator = None
         timed = _FirstChunkTimer(resp, start_mono)
         try:
-            if incoming_wire == upstream_wire:
-                async for item in _with_sse_heartbeats(timed.aiter_bytes()):
+            while True:
+                attempt += 1
+                # 首字耗时按"当前这一次尝试"算，重发后不会把上一次的等待算进来。
+                timed = _FirstChunkTimer(
+                    resp, start_mono if attempt == 1 else time.monotonic()
+                )
+                # 探测阶段独占这一条底层迭代器：心跳照常转发给客户端，数据字节
+                # 先攒着，确认上游真的开始产出内容后再放行。
+                iterator = _with_sse_heartbeats(timed.aiter_bytes()).__aiter__()
+                probe = _StreamHeadProbe(upstream_wire)
+                if not probe_stream:
+                    probe.commit()
+                deadline = time.monotonic() + EARLY_STREAM_PROBE_SECONDS
+                while not probe.committed:
+                    try:
+                        item = await iterator.__anext__()
+                    except StopAsyncIteration:
+                        early_error = "上游在返回任何内容前结束了流"
+                        break
+                    except Exception as exc:
+                        early_error = _exc_message(exc)
+                        break
                     if item is SSE_HEARTBEAT:
-                        chunk = b": keep-alive\n\n"
-                    else:
-                        chunk = item
+                        yield b": keep-alive\n\n"
+                        continue
+                    if probe.feed(item):
+                        break
+                    if time.monotonic() >= deadline:
+                        # 上游只是慢（长推理），不是失败：放行，别让客户端干等。
+                        probe.commit()
+                if probe.committed:
+                    guarded = _PrefixedResponse(resp, bytes(probe.pending), iterator)
+                    break
+                early_error = probe.error or early_error
+                await iterator.aclose()
+                if resp is not None:
+                    await resp.aclose()
+                    resp = None
+                if attempt > early_retry_budget:
+                    break
+                # 内容一个字节都还没到客户端，重发整条请求是安全的，
+                # 代价只是多算一次输入 token。
+                rec["retry_count"] += 1
+                await asyncio.sleep(EARLY_STREAM_RETRY_BACKOFF * attempt)
+                try:
+                    req = client.build_request(
+                        "POST",
+                        url,
+                        json=request_body,
+                        headers=upstream_headers(supplier, request, body),
+                    )
+                    resp = await client.send(req, stream=True)
+                except Exception as exc:
+                    early_error = _exc_message(exc)
+                    resp = None
+                    break
+                if resp.status_code >= 400:
+                    early_error = (await resp.aread()).decode("utf-8", "replace")[:300]
+                    await resp.aclose()
+                    resp = None
+                    break
+            if guarded is None:
+                raise RuntimeError(early_error or "上游在返回任何内容前失败了")
+            if incoming_wire == upstream_wire:
+                # 心跳在探测阶段就已经接进这条流里了，这里只管原样转发。
+                async for chunk in guarded.aiter_bytes():
                     sniffer.feed(chunk)
                     yield chunk
             elif incoming_wire == "responses":
                 conv = ChatToResponses(model, tool_bridge=tool_bridge)
-                async for evt in _with_sse_heartbeats(conv.convert(timed)):
+                async for evt in _with_sse_heartbeats(conv.convert(guarded)):
                     if evt is SSE_HEARTBEAT:
                         chunk = b": keep-alive\n\n"
                     else:
@@ -3154,10 +3935,10 @@ async def relay(request: Request, incoming_wire: str):
                 # Anthropic SSE 不以 [DONE] 结尾，message_stop 就是终止事件。
                 anth_conv = _ChatToAnthropic(model)
                 if upstream_wire == "chat":
-                    source = _iter_chat_chunks_for_anthropic(timed)
+                    chat_source = _iter_chat_chunks_for_anthropic(guarded)
                 else:
-                    source = ResponsesToChat(model).convert(timed)
-                async for evt in _with_sse_heartbeats(_stream_chat_to_anthropic(source, model, anth_conv)):
+                    chat_source = ResponsesToChat(model).convert(guarded)
+                async for evt in _with_sse_heartbeats(_stream_chat_to_anthropic(chat_source, model, anth_conv)):
                     if evt is SSE_HEARTBEAT:
                         chunk = b": keep-alive\n\n"
                     else:
@@ -3166,7 +3947,7 @@ async def relay(request: Request, incoming_wire: str):
                     yield chunk
             else:
                 conv = ResponsesToChat(model)
-                async for evt in _with_sse_heartbeats(conv.convert(timed)):
+                async for evt in _with_sse_heartbeats(conv.convert(guarded)):
                     if evt is SSE_HEARTBEAT:
                         chunk = b": keep-alive\n\n"
                     else:
@@ -3199,15 +3980,22 @@ async def relay(request: Request, incoming_wire: str):
                 sniffer.feed(chunk)
                 yield chunk
         finally:
+            if iterator is not None:
+                # 客户端中途断开时也要把心跳泵一起收掉，避免留下悬挂任务。
+                try:
+                    await iterator.aclose()
+                except Exception:
+                    pass
             u = anth_conv.usage if anth_conv is not None else sniffer.usage
             _update_record_usage(rec, u)
             stream_status = anth_conv.status if anth_conv is not None else sniffer.status
-            if rec["status"] == "ok" and stream_status in ("failed", "incomplete"):
+            if rec["status"] == "ok" and stream_status in ("failed", "incomplete", "error"):
                 rec["status"] = stream_status
             rec["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
             rec["first_token_ms"] = timed.first_ms
             stats.record(rec)
-            await resp.aclose()
+            if resp is not None:
+                await resp.aclose()
             await client.aclose()
 
     return StreamingResponse(gen(), status_code=resp.status_code, media_type="text/event-stream")

@@ -30,3 +30,4 @@ router/LLMRouter*.exe
 # Local Windows shortcuts and generated browser screenshots
 router/*.lnk
 router/output/
+output/

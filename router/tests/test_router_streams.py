@@ -1475,6 +1475,41 @@ class RouterRequestConversionTests(unittest.TestCase):
         self.assertIsInstance(arguments, str)
         self.assertEqual(arguments, '{"path":"README.md"}')
 
+    def test_assistant_text_precedes_tool_calls_so_results_stay_adjacent(self):
+        """带正文的 assistant 必须输出 reasoning -> message -> function_call。
+
+        严格校验的上游（pixel /v1/responses）把正文夹在 function_call 与
+        function_call_output 之间会判定为错配，返回 code 11148。
+        """
+        responses = router.chat_to_responses({
+            "model": "deepseek-v4.1-flash",
+            "messages": [
+                {"role": "user", "content": "Read the note."},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "Read it first.",
+                    "content": "我先读取约束文档。",
+                    "tool_calls": [{
+                        "id": "call_read",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": '{"file_path":"a.md"}'},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": "call_read", "content": "Error: not a regular file"},
+            ],
+        })
+
+        kinds = [item["type"] for item in responses["input"]]
+        self.assertEqual(
+            kinds,
+            ["message", "reasoning", "message", "function_call", "function_call_output"],
+        )
+        # function_call 与它的结果必须相邻，中间不能夹任何 assistant 正文项。
+        call_index = kinds.index("function_call")
+        self.assertEqual(kinds[call_index + 1], "function_call_output")
+        self.assertEqual(responses["input"][call_index]["call_id"], "call_read")
+        self.assertEqual(responses["input"][call_index + 1]["call_id"], "call_read")
+
     def test_chat_reasoning_content_becomes_a_standalone_reasoning_item(self):
         responses = router.chat_to_responses({
             "model": "gpt-5.6",
@@ -2221,6 +2256,110 @@ class ResponsesToChatTests(unittest.TestCase):
         })
 
         self.assertEqual(repeated, [])
+
+
+    def test_truncated_function_call_arguments_become_an_error_frame(self):
+        """上游在参数写完前断流时，半截 JSON 不能当成工具调用交给客户端。"""
+        converter = router.ResponsesToChat("responses-model")
+        converter.on_event({
+            "type": "response.output_item.added",
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "edit",
+                "arguments": "",
+            },
+        })
+        emitted = []
+        for piece in ('{"file_path": "F:\\\\a', '\\\\b.md", "new_string": "21. **帖'):
+            emitted.extend(converter.on_event({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": piece,
+            }))
+
+        # 增量先攒着：客户端此时只会看到工具名，看不到半截参数。
+        deltas = [c["choices"][0]["delta"] for c in emitted]
+        self.assertFalse(any("content" in d for d in deltas))
+        streamed_args = "".join(
+            call["function"].get("arguments", "")
+            for d in deltas for call in (d.get("tool_calls") or [])
+        )
+        self.assertEqual(streamed_args, "")
+
+        final = converter.finish_events()
+        self.assertEqual(len(final), 1)
+        self.assertEqual(final[0]["error"]["code"], "upstream_stream_error")
+        self.assertIn("中断", final[0]["error"]["message"])
+        self.assertEqual(converter.status, "failed")
+
+    def test_complete_function_call_arguments_are_emitted_exactly_once(self):
+        converter = router.ResponsesToChat("responses-model")
+        converter.on_event({
+            "type": "response.output_item.added",
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "edit",
+                "arguments": "",
+            },
+        })
+        collected = []
+        for piece in ('{"file_path"', ': "/a.md"}'):
+            collected.extend(converter.on_event({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": piece,
+            }))
+        self.assertEqual(collected, [])
+
+        collected.extend(converter.on_event({
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_1",
+            "arguments": '{"file_path": "/a.md"}',
+        }))
+        arguments = [
+            call["function"]["arguments"]
+            for chunk in collected
+            for call in (chunk["choices"][0]["delta"].get("tool_calls") or [])
+        ]
+        self.assertEqual(arguments, ['{"file_path": "/a.md"}'])
+
+        final = converter.finish_events()
+        self.assertEqual(final[-1]["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(
+            [
+                call["function"]["arguments"]
+                for chunk in final
+                for call in (chunk["choices"][0]["delta"].get("tool_calls") or [])
+            ],
+            [],
+        )
+
+    def test_reasoning_echo_is_not_forwarded_as_content(self):
+        """像素在正文为空时会把 reasoning 灌进 content，不能当成回答转给客户端。"""
+        converter = router.ResponsesToChat("responses-model")
+        reasoning = "Plan the cleanup. Keep docs, drop dumps."
+        for piece in ("Plan the cleanup. ", "Keep docs, drop dumps."):
+            converter.on_event({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_1",
+                "delta": piece,
+            })
+
+        echo = converter.on_event({
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": reasoning,
+        })
+        self.assertEqual(echo, [])
+
+        final = converter.finish_events()
+        self.assertEqual(len(final), 1)
+        self.assertEqual(final[0]["error"]["code"], "upstream_stream_error")
+        self.assertIn("思考内容", final[0]["error"]["message"])
 
 
 class UpstreamHeaderTests(unittest.TestCase):
